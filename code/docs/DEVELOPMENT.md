@@ -141,6 +141,7 @@ Tk 控件状态用 `widget.state()` 或 `str(widget.cget("key"))` 判断；`cget
 | 改动 | 需要同步的位置 |
 |---|---|
 | 交易类型（kind） | `accounting.KINDS`、`ledger_gui.KINDS`、`terminal.KINDS`、`reports.entries`、`ledger.audit` 的统计 SQL、方向校验 |
+| 分类关键词 | `accounting.SPEND_WORDS`（说明中的早期匹配）、`KEYWORD_ADDITIONS` / `KEYWORD_PATTERNS`（兜底，可新增只用于兜底的分类）、`CONDITIONAL_KEYWORDS`（组合条件）、`MEITUAN_NON_FOOD`（排除项）、正反例测试 |
 | `decisions` 新键 | `ledger.read_decisions` 白名单、`ledger.build` 应用逻辑、界面保存/导出、用户 README、本文档 |
 | 数据库字段 | `ledger.SCHEMA`、`EVENT_FIELDS`、`sources.Record`、`build` 插入、查询 SELECT、`audit` |
 | 新建界面页 | `create_<page>`、`load_<page>`、`LedgerWindow.__init__` 中的创建顺序；`refresh` 依赖命名约定 |
@@ -167,6 +168,7 @@ Tk 控件状态用 `widget.state()` 或 `str(widget.cget("key"))` 判断；`cget
 - **模态对话框**：`simpledialog.Dialog.__init__` 会阻塞到窗口关闭；无界面测试要替换 `wait_window`。
 - **字符宽度**：界面是中文，表格列宽以像素计；新增列先对照现有 `Column` 宽度。
 - **`local_rules.py` 不入库**：真实姓名只写在这个本地文件里。不要把 `SELF_NAMES` 的具体值写回公开代码、README 或文档；测试时可以用虚构姓名临时验证。
+- **关键字兜底只影响原本待分类的流出**：新增关键字后，用账本副本重建并逐条比对，确认已分类交易（含手工复核）没有变化。交易对方优先于说明，因为说明里常有医院站名、商场名；同一字段命中多个分类时应保持原来的「待分类」或「流出用途待判断」，不要按字典顺序猜。新增词优先用具体词（如「牛肉汤」），谨慎使用「美食」「火锅」「旅途」这类泛词，避免把商贸公司、商店名误判为对应分类；「美团」这类平台名要用 `MEITUAN_NON_FOOD` 之类的上下文排除项保护，组合条件放到 `CONDITIONAL_KEYWORDS`。
 
 ## 6. 代码约定
 

@@ -35,6 +35,34 @@ SPEND_WORDS = {
     "文娱": r"电影院|影城|游戏|Steam|Valve|演出|景区门票",
     "捐赠": r"捐赠|捐款|公益",
 }
+# Extra keywords used only for outflows that the earlier rules could not classify.
+KEYWORD_ADDITIONS = {
+    "购物": r"唯品会|麦德龙|ALDI|奥乐齐|盒马|先用后付|先购后付",
+    "医疗": r"卫生院|社区卫生|卫生服务|门诊|诊所|口腔|眼科|体检",
+    "文娱": (r"图文|打印|书店|网咖|网吧|剧院|景区|门票|剧本杀|哔哩哔哩|羽毛球|球馆|健身|"
+             r"游泳|乒乓球|篮球|足球|旅游|旅行|旅行社|景点"),
+    "交通": r"交通|轨道|出行|高铁|车票",
+    "餐饮": (r"KFC|老乡鸡|华莱士|德克士|汉堡王|牛肉汤|牛肉饭|牛肉面|牛肉馆|火锅|烧烤|串串|"
+             r"麻辣烫|米线|面馆|粉店|餐馆|美食|点餐|蛋糕|酒家|寿喜烧|鸡煲|1点点|美团|堂食|"
+             r"丰e足食|赤豆西施|蜜雪冰城|米轩煎饼|食品|好想来|零食"),
+    "理发": r"快剪|单剪|理发|美发|剪发",
+    "AI": (r"DeepSeek|ChatGPT|OpenAI|GPT|Claude|Anthropic|Gemini|智谱|ChatGLM|GLM|"
+           r"通义千问|通义|文心一言|文心|讯飞星火|星火|Kimi|Moonshot|豆包|百川|MiniMax|"
+           r"阶跃星辰|月之暗面|阿里云|腾讯云|百度智能云|火山引擎"),
+}
+# Rules that need both the counterparty and the description to match.
+CONDITIONAL_KEYWORDS = (
+    ("江苏大学", ("一卡通充值",), "餐饮", "江苏大学一卡通充值"),
+)
+# "美团" alone covers food, repayments, power banks, hotels and pharmacies,
+# so non-food clues suppress that specific keyword.
+MEITUAN_NON_FOOD = re.compile(
+    r"还款|充电宝|单车|骑行|酒店|门票|机票|打车|电影|药店|买药|医药|超市|买菜|鲜花|花店|花篮|"
+    r"美发|理发|洗车|家政|维修|摄影|搬家|按摩|足疗")
+KEYWORD_PATTERNS = {}
+for category in {**SPEND_WORDS, **KEYWORD_ADDITIONS}:
+    parts = [pattern for pattern in (SPEND_WORDS.get(category), KEYWORD_ADDITIONS.get(category)) if pattern]
+    KEYWORD_PATTERNS[category] = re.compile("|".join(parts), re.IGNORECASE)
 INCOME_WORDS = {
     "劳务": r"劳务|报劳",
     "工资": r"工资|薪资|薪酬",
@@ -55,6 +83,42 @@ TRANSFER_CATEGORY_ALIASES = {"本人账户划转", "账户资金划转"}
 
 def normalize_category(category):
     return "账户划转" if category in TRANSFER_CATEGORY_ALIASES else category
+
+
+def keyword_match(category, text, context):
+    """Return the first acceptable keyword, skipping 美团 hits with non-food clues."""
+    for match in KEYWORD_PATTERNS[category].finditer(text):
+        word = match.group(0)
+        if category == "餐饮" and word == "美团" and MEITUAN_NON_FOOD.search(context):
+            continue
+        return word
+    return None
+
+
+def keyword_category(record):
+    """Classify an unconfirmed outflow from keywords in its counterparty, memo, description, or source type.
+
+    Returns (category, matched text) when exactly one category matches a field.
+    Counterparty is checked first because descriptions often contain station or
+    mall names, and an ambiguous field is left unclassified instead of guessing.
+    """
+    party = (record.counterparty or "").replace("交通银行", "")
+    other = " ".join(filter(None, (record.memo, record.description, record.source_type))).replace("交通银行", "")
+    context = f"{party} {other}"
+    for required_party, required_terms, category, label in CONDITIONAL_KEYWORDS:
+        if required_party in party and any(term in other for term in required_terms):
+            return category, label
+    for text in (party, other):
+        if not text.strip():
+            continue
+        matches = {}
+        for category in KEYWORD_PATTERNS:
+            word = keyword_match(category, text, context)
+            if word:
+                matches[category] = word
+        if matches:
+            return next(iter(matches.items())) if len(matches) == 1 else None
+    return None
 
 
 def classify(record):
@@ -105,6 +169,10 @@ def classify(record):
     for category, pattern in SPEND_WORDS.items():
         if re.search(pattern, text, re.IGNORECASE):
             return "expense", category, "交易说明中的类别关键词"
+    keyword = keyword_category(record)
+    if keyword:
+        category, word = keyword
+        return "expense", category, f"关键字：{word}"
     if re.search(r"消费|缴费|群收款|扫二维码付款", kind):
         return "expense", "待分类", "交易类型可确认支出"
     return "pending", "流出用途待判断", "交易用途未知"
