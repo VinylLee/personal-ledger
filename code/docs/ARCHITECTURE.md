@@ -169,7 +169,7 @@ accounting 规则链（分类、去重、划转、退款/报销关联）── l
 
 ## 7. 统计口径
 
-`reports.entries(db, actions)` 把每笔 event 折算成统计条目；`summarize` 再按日期/币种/方向/分类聚合。`actions` 是 `{"refund": 模式, "reimbursement": 模式}`。
+`reports.entries(db, actions)` 把每笔 event 折算成统计条目。`filtered_entries` 按日期、币种、方向和分类筛选条目，供 `summarize` 和图表明细使用。`Entry.report_amount` 返回计入报表的带符号金额。`actions` 是 `{"refund": 模式, "reimbursement": 模式}`。
 
 确认关联的退款和报销在读取时使用原支出的分类。交易明细筛选和报表均使用该分类，`events.category` 继续记录回款自身的分类，供解除关联后使用。
 
@@ -202,6 +202,8 @@ accounting 规则链（分类、去重、划转、退款/报销关联）── l
 
 - `self.forms[page][key]`：筛选条件的 `StringVar`。
 - `self.applied_forms[page]`：最近一次实际查询使用的条件，用于切回页签时还原。
+- 图表绘制时为每个扇区和柱保留悬停内容及日期或分类。点击后用已应用的图表条件进入临时明细视图，按统计条目的交易编号取回原始流水。清除图表筛选时恢复上次普通明细查询。
+- 交易明细的「隐藏报销回款及已报销支出」开关保存在该页筛选状态。启用时，从已筛出的明细中移除报销类型流水和已确认报销关联的两端，再计算合计。
 - `self.page_versions[page]`：上次加载时的数据库版本（inode、大小、修改时间）。切页签时数据库变了就自动刷新。
 - `Table.view_state()` / `restore_view()`：保存和恢复排序、滚动位置、多选行；行标识由 `Table.row_key` 生成（交易用 `event_id`）。
 - 写操作统一走 `save_review_change(action)`，负责忙指针和错误弹窗。

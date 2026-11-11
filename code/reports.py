@@ -17,6 +17,12 @@ class Entry:
     bucket: str
     amount: int
 
+    @property
+    def report_amount(self):
+        if self.side == "expense" and self.bucket != "expense":
+            return -self.amount
+        return self.amount
+
 
 def decimal_text(amount):
     units, cents = divmod(abs(amount), 100)
@@ -66,13 +72,20 @@ def entries(db, actions):
             yield Entry(*prefix, "expense", category, kind, amount)
 
 
+def filtered_entries(db, actions, *, start, end, currency, side, categories):
+    for item in entries(db, actions):
+        if (not start <= item.day <= end or currency and item.currency != currency
+                or side and item.side != side
+                or categories is not None and item.category not in categories):
+            continue
+        yield item
+
+
 def summarize(db, by, start, end, currency, side, category, actions):
     groups = defaultdict(list)
     use_category = "category" in by
-    for item in entries(db, actions):
-        if (not start <= item.day <= end or currency and item.currency != currency
-                or side and item.side != side or category and item.category != category):
-            continue
+    for item in filtered_entries(db, actions, start=start, end=end, currency=currency, side=side,
+                                 categories={category} if category else None):
         period = item.day if by.startswith("day") else item.day[:7] if by.startswith("month") else ""
         key = (period, item.currency, item.side if use_category else "",
                item.category if use_category else "")
@@ -87,10 +100,10 @@ def summarize(db, by, start, end, currency, side, category, actions):
             amounts[item.bucket] += item.amount
             counts[item.bucket].add(item.event_id)
             if item.side == "income":
-                amounts["total_income"] += item.amount
-            if item.side == "expense" and item.bucket != "expense":
-                amounts["offsets"] += item.amount
-        net_expense = amounts["expense"] - amounts["offsets"]
+                amounts["total_income"] += item.report_amount
+            else:
+                amounts["net_expense"] += item.report_amount
+        net_expense = amounts["net_expense"]
         line = dict(
             income=amounts["total_income"], ordinary_income=amounts["income"],
             expense=amounts["expense"], refunds=amounts["refund"],

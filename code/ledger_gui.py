@@ -10,7 +10,7 @@ from argparse import Namespace
 from calendar import monthcalendar, monthrange
 from collections import Counter, defaultdict
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -20,7 +20,7 @@ from tkinter.scrolledtext import ScrolledText
 
 import exchange
 import ledger
-from reports import PENDING_DIRECTIONS, decimal_text, entries, linked_receipt_categories
+from reports import PENDING_DIRECTIONS, decimal_text, entries, filtered_entries, linked_receipt_categories
 from sources import minor
 
 ALL = "全部"
@@ -231,6 +231,19 @@ class Column:
     title: str
     width: int
     format: str = ""
+
+
+@dataclass(frozen=True)
+class ChartScope:
+    start: str
+    end: str
+    currency: str
+    side: str
+    categories: tuple[str, ...] | None
+    basis: str
+    refunds: str | None
+    reimbursements: str | None
+
 
 
 class Table(ttk.Frame):
@@ -902,6 +915,9 @@ class LedgerWindow:
         self.totals = tk.StringVar(root)
         self.transaction_totals = tk.StringVar(root)
         self.chart_note = tk.StringVar(root)
+        self.chart_scope = None
+        self.chart_detail = None
+        self.chart_detail_text = tk.StringVar(root)
         self._rate_book = None
         self._rate_fetching = False
         self._rate_attempted = False
@@ -1054,23 +1070,36 @@ class LedgerWindow:
 
     def create_transactions(self):
         page = self.page("transactions", "交易明细")
-        bar = self.toolbar(page)
+        self.transaction_filters = ttk.Frame(page)
+        self.transaction_filters.pack(fill="x")
+        bar = self.toolbar(self.transaction_filters)
         self.date_fields(bar, "transactions")
         self.field(bar, "transactions", "kind", "交易类型", ALL, [ALL, *KINDS.values()], 8)
         self.field(bar, "transactions", "currency", "币种", ALL, self.currencies, 5)
-        bar = self.toolbar(page)
+        bar = self.toolbar(self.transaction_filters)
         self.field(bar, "transactions", "category", "分类", ALL, self.categories, 14)
         self.field(bar, "transactions", "search", "交易对方、说明、交易编号或订单号", "", width=31)
         self.field(bar, "transactions", "amount", "原金额", "", width=12)
         ttk.Button(bar, text="查询", style="Accent.TButton", command=lambda: self.refresh("transactions")).pack(
             side="left", anchor="s")
-        actions = self.toolbar(page)
+        self.chart_detail_bar = ttk.Frame(page)
+        ttk.Button(self.chart_detail_bar, text="清除图表筛选", command=self.clear_chart_detail).pack(
+            side="right", padx=(10, 0))
+        ttk.Label(self.chart_detail_bar, textvariable=self.chart_detail_text, wraplength=660,
+                  justify="left").pack(side="left", fill="x", expand=True)
+        actions = self.transaction_actions = self.toolbar(page)
         for label, command in (("查看原始流水", lambda: self.show_selected("transactions")),
                                ("编辑交易", self.edit_transaction),
                                ("确认无关联", lambda: self.mark_unassociated("transactions"))):
             ttk.Button(actions, text=label, command=command).pack(side="left", padx=(0, 8))
-        ttk.Label(actions, text="Ctrl / Shift 多选可批量编辑", style="Muted.TLabel").pack(
-            side="left", padx=(4, 0))
+        hide_reimbursements = tk.BooleanVar(actions, False)
+        self.forms["transactions"]["hide_reimbursements"] = hide_reimbursements
+        self.hide_reimbursements_button = ttk.Checkbutton(
+            actions, text="隐藏报销回款及已报销支出", variable=hide_reimbursements,
+            command=lambda: self.refresh("transactions", preserve=True))
+        self.hide_reimbursements_button.pack(side="left", padx=(0, 8))
+        self.transaction_edit_hint = ttk.Label(actions, text="Ctrl / Shift 多选可批量编辑", style="Muted.TLabel")
+        self.transaction_edit_hint.pack(side="left", padx=(4, 0))
         summary_label(page, self.transaction_totals)
         table = self.add_table("transactions", page)
         table.tree.configure(selectmode="extended")
@@ -1130,6 +1159,60 @@ class LedgerWindow:
         self.charts = LedgerCharts()
         self.chart_canvas = FigureCanvasTkAgg(self.charts.figure, master=page)
         self.chart_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.chart_tooltip = tk.Label(page, justify="left", anchor="w", wraplength=420,
+                                      background="#F8FAFC", foreground="#172B42", highlightbackground="#CBD5E1",
+                                      highlightthickness=1, padx=10, pady=7, font="TkDefaultFont")
+        self.chart_canvas.mpl_connect("motion_notify_event", self.hover_chart)
+        self.chart_canvas.mpl_connect("figure_leave_event", self.hide_chart_tooltip)
+        self.chart_canvas.mpl_connect("button_press_event", self.open_chart_detail)
+
+    def hover_chart(self, event):
+        target = self.charts.target_at(event)
+        if target is None:
+            self.hide_chart_tooltip()
+            return
+        tooltip = self.chart_tooltip
+        canvas = self.chart_canvas.get_tk_widget()
+        page = canvas.master
+        if tooltip.cget("text") != target.tooltip:
+            tooltip.configure(text=target.tooltip)
+            tooltip.update_idletasks()
+        canvas.configure(cursor="hand2")
+        mouse = event.guiEvent
+        x = canvas.winfo_x() + (mouse.x if mouse is not None else event.x)
+        y = canvas.winfo_y() + (mouse.y if mouse is not None else canvas.winfo_height() - event.y)
+        width, height = tooltip.winfo_reqwidth(), tooltip.winfo_reqheight()
+        left = x + 14 if x + width + 14 <= page.winfo_width() else max(0, x - width - 14)
+        top = y + 14 if y + height + 14 <= page.winfo_height() else max(0, y - height - 14)
+        tooltip.place(x=left, y=top)
+        tooltip.lift()
+
+    def hide_chart_tooltip(self, _event=None):
+        self.chart_tooltip.place_forget()
+        self.chart_canvas.get_tk_widget().configure(cursor="")
+
+    def open_chart_detail(self, event):
+        if event.button != 1 or self.chart_scope is None:
+            return
+        target = self.charts.target_at(event)
+        if target is None:
+            return
+        scope = self.chart_scope
+        self.chart_detail = replace(scope, start=target.start or scope.start, end=target.end or scope.end,
+                                    categories=target.categories if target.categories is not None else scope.categories)
+        self.hide_chart_tooltip()
+        self.transaction_filters.pack_forget()
+        self.hide_reimbursements_button.pack_forget()
+        self.chart_detail_bar.pack(fill="x", pady=(0, 10), before=self.transaction_actions)
+        self.refresh("transactions")
+        self.tabs.select(self.tables["transactions"].master)
+
+    def clear_chart_detail(self):
+        self.chart_detail = None
+        self.chart_detail_bar.pack_forget()
+        self.transaction_filters.pack(fill="x", before=self.transaction_actions)
+        self.hide_reimbursements_button.pack(side="left", padx=(0, 8), before=self.transaction_edit_hint)
+        self.refresh("transactions", use_applied=True)
 
     def change_review_type(self):
         kind = REVIEW_TYPES[self.get("review", "type")]
@@ -1145,6 +1228,8 @@ class LedgerWindow:
 
     def tab_changed(self, _event):
         page = self.pages[self.tabs.select()]
+        if self.active_page == "charts" and page != "charts":
+            self.hide_chart_tooltip()
         if self.active_page and self.active_page != page:
             self.page_status[self.active_page] = self.status.get()
         self.active_page = page
@@ -1160,8 +1245,9 @@ class LedgerWindow:
         table = self.tables.get(page)
         view = table.view_state() if preserve and table else None
         current = {name: value.get() for name, value in self.forms[page].items()}
-        if use_applied:
-            for name, value in self.applied_forms[page].items():
+        applied = self.applied_forms.get(page) if use_applied else None
+        if applied is not None:
+            for name, value in applied.items():
                 self.forms[page][name].set(value)
         previous_status = self.status.get()
         try:
@@ -1172,12 +1258,13 @@ class LedgerWindow:
             self.loaded_pages.add(page)
             self.page_versions[page] = self.database_version()
             self.page_status[page] = self.status.get()
-            self.applied_forms[page] = {name: value.get() for name, value in self.forms[page].items()}
+            if page != "transactions" or self.chart_detail is None:
+                self.applied_forms[page] = {name: value.get() for name, value in self.forms[page].items()}
         except (ValueError, ArithmeticError, sqlite3.Error) as exc:
             self.status.set(f"查询失败  {exc}")
             messagebox.showerror("查询失败", str(exc), parent=self.root)
         finally:
-            if use_applied:
+            if applied is not None:
                 for name, value in current.items():
                     self.forms[page][name].set(value)
             if self.active_page and self.active_page != page:
@@ -1290,11 +1377,22 @@ class LedgerWindow:
         self.status.set(f"{len(rows)} 组汇总  ·  账本内待复核 {pending} 笔，按原方向暂计收支")
 
     def load_transactions(self, db):
+        if self.chart_detail is not None:
+            self.load_chart_transactions(db)
+            return
         get = lambda key: self.get("transactions", key)
         kinds = {label: key for key, label in KINDS.items()}
         args = Namespace(**self.scope("transactions"), kind=kinds.get(get("kind")),
                          search=get("search") or None, amount=minor(get("amount")) if get("amount") else None)
         rows = ledger.transactions(db, args, include_own_category=True)
+        if self.forms["transactions"]["hide_reimbursements"].get():
+            reimbursed_ids = {
+                event_id for link in db.execute("""
+                    SELECT first_id, second_id FROM links
+                    WHERE relation = 'reimbursement' AND status = 'confirmed'
+                """) for event_id in link
+            }
+            rows = [row for row in rows if row["kind"] != "reimbursement" and row["id"] not in reimbursed_ids]
         ids = {row["id"] for row in rows}
         totals = {row["currency"]: Counter() for row in rows}
         for item in entries(db, {"refund": "net", "reimbursement": "net"}):
@@ -1309,6 +1407,35 @@ class LedgerWindow:
         self.show_records("transactions", rows)
         self.status.set(f"{len(rows)} 笔交易")
 
+    def load_chart_transactions(self, db):
+        scope = self.chart_detail
+        actions = {"refund": scope.refunds or scope.basis, "reimbursement": scope.reimbursements or scope.basis}
+        contributions = Counter()
+        for item in filtered_entries(db, actions, start=scope.start, end=scope.end, currency=scope.currency,
+                                     side=scope.side, categories=scope.categories):
+            contributions[item.event_id] += item.report_amount
+        args = Namespace(start=scope.start, end=scope.end, currency=scope.currency,
+                         kind=None, category=None, amount=None, search=None)
+        rows = [row for row in ledger.transactions(db, args, include_own_category=True)
+                if row["id"] in contributions]
+        for row in rows:
+            row["chart_amount"] = decimal_text(contributions[row["id"]])
+        side = DIRECTIONS[scope.side]
+        category = "、".join(scope.categories) if scope.categories is not None else "全部分类"
+        period = scope.start if scope.start == scope.end else f"{scope.start} 至 {scope.end}"
+        basis = next(label for label, key in BASIS.items() if key == scope.basis)
+        adjustment_labels = {key: label for label, key in ADJUSTMENTS.items()}
+        modes = [basis]
+        if scope.refunds:
+            modes.append(f"退款{adjustment_labels[scope.refunds]}")
+        if scope.reimbursements:
+            modes.append(f"报销{adjustment_labels[scope.reimbursements]}")
+        self.chart_detail_text.set(f"图表筛选  ·  {period}  ·  {scope.currency} {side}  ·  {' / '.join(modes)}\n{category}")
+        total = Decimal(decimal_text(sum(contributions.values())))
+        self.transaction_totals.set(f"计入图表合计  {total:,.2f} {scope.currency}")
+        self.show_records("transactions", rows, chart_amounts=True)
+        self.status.set(f"{len(rows)} 笔交易")
+
     def load_charts(self, db):
         get = lambda key: self.get("charts", key)
         period = "month" if get("period") == "按月" else "day"
@@ -1318,8 +1445,13 @@ class LedgerWindow:
         categories = ledger.report(db, args)
         args.by = period
         periods = ledger.report(db, args)
+        bounds = dict(db.execute("SELECT key, value FROM metadata WHERE key IN ('start', 'end')"))
+        self.hide_chart_tooltip()
         note = self.charts.draw(categories, periods, side=side, period=period, currency=args.currency)
-        self.chart_note.set(note or "按当前筛选和统计口径计算。")
+        self.chart_scope = ChartScope(max(args.start, bounds["start"]), min(args.end, bounds["end"]), args.currency,
+                                      side, (args.category,) if args.category else None,
+                                      args.basis, args.refunds, args.reimbursements)
+        self.chart_note.set(f"悬停查看金额，点击查看交易明细。 {note}".strip())
         self.chart_canvas.draw_idle()
         self.status.set(f"{len(categories)} 个分类  ·  {len(periods)} 个{'月' if period == 'month' else '日期'}")
 
@@ -1388,12 +1520,14 @@ class LedgerWindow:
         unit = "组关联" if paired else "笔交易"
         self.status.set(f"{len(rows)} {unit}")
 
-    def show_records(self, page, rows, *, unlinked=False):
+    def show_records(self, page, rows, *, unlinked=False, chart_amounts=False):
         columns = [Column("stamp", "时间" if page == "transactions" else "日期", 160),
                    Column("source_label", "来源", 70), Column("type_label", "类型", 76),
                    Column("category", "分类", 132), Column("currency", "币种", 58),
-                   Column("amount", "未分摊金额" if unlinked else "金额", 100, "money"),
-                   Column("counterparty", "交易对方", 158), Column("note", "说明", 208)]
+                   Column("amount", "未分摊金额" if unlinked else "流水金额" if chart_amounts else "金额", 100, "money")]
+        if chart_amounts:
+            columns.append(Column("chart_amount", "计入图表金额", 118, "money"))
+        columns.extend([Column("counterparty", "交易对方", 158), Column("note", "说明", 208)])
         for row in rows:
             row["stamp"] = (row.get("occurred_at") or row["day"]).replace("T", " ")
             row["source_label"] = SOURCES.get(row["source"], row["source"])
