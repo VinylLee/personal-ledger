@@ -9,11 +9,24 @@ from decimal import Decimal
 from sources import BANKS, PLATFORMS, minor
 
 try:
-    from local_rules import SELF_NAMES
+    import local_rules
 except ModuleNotFoundError as exc:
     if exc.name != "local_rules":
         raise
-    SELF_NAMES = ()
+    local_rules = None
+
+SELF_NAMES = getattr(local_rules, "SELF_NAMES", ())
+SPEND_WORDS = getattr(local_rules, "SPEND_WORDS", {})
+KEYWORD_ADDITIONS = getattr(local_rules, "KEYWORD_ADDITIONS", {})
+CONDITIONAL_KEYWORDS = getattr(local_rules, "CONDITIONAL_KEYWORDS", ())
+MEITUAN_NON_FOOD = getattr(local_rules, "MEITUAN_NON_FOOD", None)
+INCOME_WORDS = getattr(local_rules, "INCOME_WORDS", {})
+LAB_WATER = getattr(local_rules, "LAB_WATER", None)
+LANDLORD_KEYWORD = getattr(local_rules, "LANDLORD_KEYWORD", "")
+FOOD_CONTEXT_KEYWORD = getattr(local_rules, "FOOD_CONTEXT_KEYWORD", "")
+KEYWORD_IGNORE_TERMS = getattr(local_rules, "KEYWORD_IGNORE_TERMS", ())
+COUNTERPARTY_WATER_RULE = getattr(local_rules, "COUNTERPARTY_WATER_RULE", "交易对方规则")
+LANDLORD_RULE = getattr(local_rules, "LANDLORD_RULE", "交易对方规则")
 
 DEFAULT_REIMBURSEMENT_TOLERANCE = Decimal("5")
 
@@ -23,55 +36,14 @@ CATEGORIES = {
     "充值缴费": "生活缴费", "医疗健康": "医疗", "文化休闲": "文娱",
     "商业服务": "商业服务",
 }
-SPEND_WORDS = {
-    "餐饮": r"餐厅|餐饮|咖啡|奶茶|面包|食堂|小吃|早餐|快餐|外卖|肯德基|麦当劳",
-    "交通": r"铁路|火车|地铁|公交|客运|滴滴|机票|航空|12306|接驳车|打车|网约车",
-    "车辆": r"充电桩|桩小盟|停车|加油|高速通行|ETC|汽车",
-    "医疗": r"医院|药房|药店|挂号|医疗",
-    "教育": r"学费|教材|报名费|培训",
-    "生活缴费": r"水费|电费|燃气费|话费|物业费|宽带|供电|联通|中国移动|中国电信",
-    "住宿": r"酒店|宾馆|民宿|住宿",
-    "购物": r"超市|百货|拼多多|淘宝|天猫|京东|山姆|便利店",
-    "文娱": r"电影院|影城|游戏|Steam|Valve|演出|景区门票",
-    "捐赠": r"捐赠|捐款|公益",
-}
-# Extra keywords used only for outflows that the earlier rules could not classify.
-KEYWORD_ADDITIONS = {
-    "购物": r"唯品会|麦德龙|ALDI|奥乐齐|盒马|先用后付|先购后付",
-    "医疗": r"卫生院|社区卫生|卫生服务|门诊|诊所|口腔|眼科|体检",
-    "文娱": (r"图文|打印|书店|网咖|网吧|剧院|景区|门票|剧本杀|哔哩哔哩|羽毛球|球馆|健身|"
-             r"游泳|乒乓球|篮球|足球|旅游|旅行|旅行社|景点"),
-    "交通": r"交通|轨道|出行|高铁|车票",
-    "餐饮": (r"KFC|老乡鸡|华莱士|德克士|汉堡王|牛肉汤|牛肉饭|牛肉面|牛肉馆|火锅|烧烤|串串|"
-             r"麻辣烫|米线|面馆|粉店|餐馆|美食|点餐|蛋糕|酒家|寿喜烧|鸡煲|1点点|美团|堂食|"
-             r"丰e足食|赤豆西施|蜜雪冰城|米轩煎饼|食品|好想来|零食"),
-    "理发": r"快剪|单剪|理发|美发|剪发",
-    "AI": (r"DeepSeek|ChatGPT|OpenAI|GPT|Claude|Anthropic|Gemini|智谱|ChatGLM|GLM|"
-           r"通义千问|通义|文心一言|文心|讯飞星火|星火|Kimi|Moonshot|豆包|百川|MiniMax|"
-           r"阶跃星辰|月之暗面|阿里云|腾讯云|百度智能云|火山引擎"),
-}
-# Rules that need both the counterparty and the description to match.
-CONDITIONAL_KEYWORDS = (
-    ("江苏大学", ("一卡通充值",), "餐饮", "江苏大学一卡通充值"),
-)
-# "美团" alone covers food, repayments, power banks, hotels and pharmacies,
-# so non-food clues suppress that specific keyword.
-MEITUAN_NON_FOOD = re.compile(
-    r"还款|充电宝|单车|骑行|酒店|门票|机票|打车|电影|药店|买药|医药|超市|买菜|鲜花|花店|花篮|"
-    r"美发|理发|洗车|家政|维修|摄影|搬家|按摩|足疗")
+# Combine locally configured patterns for transactions not otherwise classified.
 KEYWORD_PATTERNS = {}
 for category in {**SPEND_WORDS, **KEYWORD_ADDITIONS}:
     parts = [pattern for pattern in (SPEND_WORDS.get(category), KEYWORD_ADDITIONS.get(category)) if pattern]
     KEYWORD_PATTERNS[category] = re.compile("|".join(parts), re.IGNORECASE)
-INCOME_WORDS = {
-    "劳务": r"劳务|报劳",
-    "工资": r"工资|薪资|薪酬",
-    "补贴": r"补贴|津贴|助学金|奖学金|研究生补助",
-}
 REIMBURSE = re.compile(r"报销|报账|报帐|垫付(?:款)?(?:归还|返还|收回)|归还垫付|代垫款")
 ADVANCE_HINT = re.compile(r"垫付|代付|代垫|代购|公款|报销")
 TRANSFER = re.compile(r"转账|网转|汇款|跨行转出|跨行转入|群收款|二维码收款|银联入账")
-LAB_WATER = re.compile(r"桶装(?:饮用|纯净|矿泉)?水|送水|水站")
 SELF_NAME_PATTERNS = tuple(
     re.compile(rf"(?:[\d*Xx\s-]+/\s*)?{re.escape(name.strip())}(?:\s*[（(][^()（）]*[）)])?")
     for name in SELF_NAMES if isinstance(name, str) and name.strip()
@@ -86,10 +58,10 @@ def normalize_category(category):
 
 
 def keyword_match(category, text, context):
-    """Return the first acceptable keyword, skipping 美团 hits with non-food clues."""
+    """Return the first acceptable keyword, applying local context exclusions."""
     for match in KEYWORD_PATTERNS[category].finditer(text):
         word = match.group(0)
-        if category == "餐饮" and word == "美团" and MEITUAN_NON_FOOD.search(context):
+        if category == "餐饮" and word == FOOD_CONTEXT_KEYWORD and MEITUAN_NON_FOOD and MEITUAN_NON_FOOD.search(context):
             continue
         return word
     return None
@@ -102,8 +74,11 @@ def keyword_category(record):
     Counterparty is checked first because descriptions often contain station or
     mall names, and an ambiguous field is left unclassified instead of guessing.
     """
-    party = (record.counterparty or "").replace("交通银行", "")
-    other = " ".join(filter(None, (record.memo, record.description, record.source_type))).replace("交通银行", "")
+    party = (record.counterparty or "")
+    other = " ".join(filter(None, (record.memo, record.description, record.source_type)))
+    for term in KEYWORD_IGNORE_TERMS:
+        party = party.replace(term, "")
+        other = other.replace(term, "")
     context = f"{party} {other}"
     for required_party, required_terms, category, label in CONDITIONAL_KEYWORDS:
         if required_party in party and any(term in other for term in required_terms):
@@ -190,10 +165,10 @@ def apply_counterparty_rules(record):
     if any(pattern.fullmatch(party) for pattern in SELF_NAME_PATTERNS):
         record.kind, record.category, record.rule = "internal", "账户划转", "交易对方为本人"
         return
-    if LAB_WATER.search(party):
-        category, rule = "实验室水费", "交易对方名称含供水关键词"
-    elif record.direction == "out" and "房东" in party:
-        category, rule = "房租", "交易对方名称标为房东"
+    if LAB_WATER and LAB_WATER.search(party):
+        category, rule = "实验室水费", COUNTERPARTY_WATER_RULE
+    elif record.direction == "out" and LANDLORD_KEYWORD and LANDLORD_KEYWORD in party:
+        category, rule = "房租", LANDLORD_RULE
     else:
         return
     if record.direction == "out" and record.kind == "pending":
