@@ -13,6 +13,9 @@ local_rules.py
 复核规则.json
 *.decisions.json
 
+# 汇率缓存（公开汇率，仅本地）
+exchange_rates.json
+
 # Python
 __pycache__/
 *.py[cod]

@@ -23,20 +23,30 @@ def decimal_text(amount):
     return f"{'-' if amount < 0 else ''}{units}.{cents:02d}"
 
 
-def entries(db, actions):
-    adjustments = defaultdict(list)
-    offsets = Counter()
-    for link in db.execute("""
-        SELECT l.*, e.category FROM links l JOIN events e ON e.id = l.second_id
+def confirmed_adjustments(db):
+    return db.execute("""
+        SELECT l.first_id, l.second_id, l.relation, l.amount_minor, e.category
+        FROM links l JOIN events e ON e.id = l.second_id
         WHERE l.status = 'confirmed' AND l.relation IN ('refund', 'reimbursement')
-    """):
-        adjustments[link["first_id"]].append((link["category"], link["amount_minor"]))
+    """)
+
+
+def linked_receipt_categories(db):
+    return {link["first_id"]: link["category"] for link in confirmed_adjustments(db)}
+
+
+def entries(db, actions):
+    receipt_categories = {}
+    offsets = Counter()
+    for link in confirmed_adjustments(db):
+        receipt_categories[link["first_id"]] = link["category"]
         if actions[link["relation"]] == "pure":
             offsets[link["second_id"]] += link["amount_minor"]
 
     for event in db.execute("SELECT * FROM events ORDER BY day, occurred_at, id"):
         event_id, day, currency = (event[k] for k in ("id", "day", "currency"))
-        kind, category, amount = (event[k] for k in ("kind", "category", "amount_minor"))
+        kind, amount = event["kind"], event["amount_minor"]
+        category = receipt_categories.get(event_id, event["category"])
         if amount == 0:
             continue
         if kind == "pending":
@@ -53,12 +63,7 @@ def entries(db, actions):
         elif kind in actions and actions[kind] == "cash":
             yield Entry(*prefix, "income", category, kind, amount)
         elif kind in actions and actions[kind] == "net":
-            portions = adjustments[event_id]
-            for original_category, share in portions:
-                yield Entry(*prefix, "expense", original_category, kind, share)
-            remainder = amount - sum(share for _, share in portions)
-            if remainder:
-                yield Entry(*prefix, "expense", category, kind, remainder)
+            yield Entry(*prefix, "expense", category, kind, amount)
 
 
 def summarize(db, by, start, end, currency, side, category, actions):

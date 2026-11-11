@@ -51,7 +51,7 @@ python code/ledger_gui.py --db 路径\其他账本.sqlite3
 ### 3.1 静态检查
 
 ```powershell
-python -m py_compile code/ledger.py code/ledger_gui.py code/accounting.py code/sources.py code/reports.py code/charts.py code/terminal.py
+python -m py_compile code/ledger.py code/ledger_gui.py code/accounting.py code/sources.py code/reports.py code/charts.py code/terminal.py code/exchange.py
 ```
 
 ### 3.2 无界面功能测试（必须用账本副本）
@@ -101,7 +101,6 @@ print("PASSED", folder)
 ```python
 import sys, tkinter as tk
 from pathlib import Path
-from pathlib import Path
 sys.path.insert(0, str(Path(r"<项目根目录>") / "code"))
 import ledger_gui
 
@@ -124,7 +123,17 @@ simpledialog.Dialog.wait_window = lambda self, window: None
 
 Tk 控件状态用 `widget.state()` 或 `str(widget.cget("key"))` 判断；`cget` 可能返回 Tcl 对象，不要直接和字符串比较。
 
-### 3.4 改动后的回归清单
+### 3.4 汇率折算测试
+
+折算只影响界面汇总标签，测试时不要联网，也不要改真实账本：
+
+- 用临时账本副本，在副本同目录预置 `exchange_rates.json`，例如 `rates: {"USD": "0.14"}`；`fetched_at` 用当前时间，`base` 必须是 `CNY`。
+- 断言 `exchange.to_cny(Decimal("100"), "USD", book)` 等于 `100 / 0.14`（方向是除法，不是乘法）。
+- 分别测试：新鲜缓存；过期缓存（先用旧值并显示「汇率缓存」）；无缓存且 `exchange.fetch_rates` 被替换为返回 `None`（显示「汇率不可用」，不抛异常）；只有 CNY 的视图不读写汇率。
+- 无界面检查 `app.totals.get()` 和 `app.transaction_totals.get()` 是否包含 `≈ 人民币` 与 `全部折合人民币`，并确认表格行数、行内容和列没有变化。
+- 测试结束删除临时目录；不要在生产账本目录生成假汇率文件。
+
+### 3.5 改动后的回归清单
 
 根据改动范围选择：
 
@@ -133,6 +142,7 @@ Tk 控件状态用 `widget.state()` 或 `str(widget.cget("key"))` 判断；`cget
 - 明细/复核：查询、排序、多选、刷新后选中与滚动位置是否保留。
 - 写操作：验证 `decisions` 内容、重建后的 `events` 字段、失败时原数据不变。
 - 界面：主窗口和涉及的对话框能否构造；按钮禁用状态是否符合当前页签。
+- 汇率：两个汇总标签正确、表格不变；CNY-only 视图不联网；断网/无缓存时正常降级。
 
 ## 4. 修改检查清单
 
@@ -147,12 +157,13 @@ Tk 控件状态用 `widget.state()` 或 `str(widget.cget("key"))` 判断；`cget
 | 新建界面页 | `create_<page>`、`load_<page>`、`LedgerWindow.__init__` 中的创建顺序；`refresh` 依赖命名约定 |
 | 新写操作 | 校验函数、`save_*`、`rebuild_with_decisions`、界面刷新与状态提示、失败回滚 |
 | 账单格式 | `sources.load_statements` 文件名识别、`normalize`、`read_rows`、必需列校验 |
+| 汇率/汇总折算 | `exchange.py`、`ledger_gui.py` 的 `report_totals_text` / `transaction_totals_text`；不要改 `reports.py`、`terminal.py`、`charts.py` 或数据库 |
 | 命令行参数 | `ledger.parser`、`main` 分派、用户 README |
 | 用户可见行为 | `README.md`、`docs/ARCHITECTURE.md`、`docs/DEVELOPMENT.md`、`docs/CHANGELOG.md` |
 
 ### 4.2 写操作的三条硬规则
 
-1. **规则合并不要整体替换。** 部分字段编辑必须保留未修改字段；类型/分类要取数据库中的有效值（原因见 ARCHITECTURE 第 6 节）。
+1. **规则合并不要整体替换。** 部分字段编辑应保留未修改字段。已关联回款在明细中显示的是原支出分类，保存时要保留回款自身分类，供解除关联后使用。
 2. **校验放在保存前。** 界面先拦截方向冲突、空分类、不计收支缺备注、重复候选；`save_*` 再做一次后端校验。
 3. **一次操作只重建一次。** 多笔修改先汇总成 `decisions`，最后调用一次 `rebuild_with_decisions`。
 
@@ -169,12 +180,15 @@ Tk 控件状态用 `widget.state()` 或 `str(widget.cget("key"))` 判断；`cget
 - **字符宽度**：界面是中文，表格列宽以像素计；新增列先对照现有 `Column` 宽度。
 - **`local_rules.py` 不入库**：真实姓名只写在这个本地文件里。不要把 `SELF_NAMES` 的具体值写回公开代码、README 或文档；测试时可以用虚构姓名临时验证。
 - **关键字兜底只影响原本待分类的流出**：修改本机规则后，用账本副本重建并比对，确认已分类交易和手工复核不受影响。交易对方优先于说明，同一字段命中多个分类时保留原来的兜底分类。
+- **汇率方向不能写反**：`rates["USD"]` 是「1 CNY 换多少 USD」，折算人民币要用除法 `金额 / rate`。全部用 `Decimal`，不要用 float；合计先累加未舍入值，最后统一格式化。
+- **汇率只在两个汇总标签**：不要改 `reports.py`、`terminal.py`、`charts.py`、表格行或数据库。只有 CNY 的视图不要触发网络；缓存文件与账本同目录，默认在 `output/exchange_rates.json`，不要提交。
+- **后台汇率刷新**：线程只做网络/文件 I/O，把结果放入队列；主线程用 `root.after` 轮询并更新 UI。不要在后台线程直接调用 `root.after` 或任何 Tk 方法（会报 `main thread is not in main loop`）；窗口关闭时用 `winfo_exists()` 保护。
 
 ## 6. 代码约定
 
 - 沿用现有风格：4 空格缩进、单行约 110 字符、界面文案用中文、标识符用英文。
 - 规则计算层（`accounting`、`reports`）尽量写纯函数或不可变数据结构；`sources.Record` 在构建期是可变的，这是既有设计。
-- 金额只以整数分计算，展示时才用 `decimal_text`；不要用浮点数算钱。
+- 账本金额只以整数分计算，展示时才用 `decimal_text`；汇率折算用 `Decimal`；不要用浮点数算钱。
 - 不要静默吞异常。界面写操作由 `save_review_change` 统一弹窗；命令行由 `main` 捕获 `ValueError` 等并退出。
 - 新增依赖前先确认是否必要；账单格式解析依赖 `xlrd`/`openpyxl`，不要引入 pandas。
 - 不要加 `print` 调试语句到生产代码；需要诊断时用现有状态栏或临时脚本。

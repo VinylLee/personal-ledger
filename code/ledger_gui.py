@@ -2,22 +2,25 @@
 
 import argparse
 import json
+import queue
 import sqlite3
+import threading
 import tkinter as tk
 from argparse import Namespace
 from calendar import monthcalendar, monthrange
 from collections import Counter, defaultdict
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from tkinter import filedialog, font, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
+import exchange
 import ledger
-from reports import PENDING_DIRECTIONS, decimal_text, entries
+from reports import PENDING_DIRECTIONS, decimal_text, entries, linked_receipt_categories
 from sources import minor
 
 ALL = "全部"
@@ -38,6 +41,123 @@ OUT_ONLY_KINDS = frozenset(("expense", "advance"))
 IN_OR_NEUTRAL_KINDS = frozenset(("income", "refund", "reimbursement"))
 DIRECTIONS = {"in": "流入", "out": "流出", "neutral": "中性", "income": "收入", "expense": "支出"}
 SOURCES = {"alipay": "支付宝", "wechat": "微信", "icbc": "工行", "ccb": "建行"}
+
+
+def report_totals_text(totals, side, book):
+    """Build report summary captions plus an optional conversion note."""
+    captions = []
+    foreign = [currency for currency in totals if currency != "CNY"]
+    combined = {"income": Decimal(0), "net_expense": Decimal(0), "balance": Decimal(0)}
+    missing, converted = set(), False
+    fields = []
+    if side != "expense":
+        fields.append(("income", "收入"))
+    if side != "income":
+        fields.append(("net_expense", "净支出"))
+    if side is None:
+        fields.append(("balance", "结余"))
+    for currency, (income, expense) in totals.items():
+        values = {"income": income, "net_expense": expense, "balance": income - expense}
+        parts = [currency]
+        for key, label in fields:
+            value = values[key]
+            text = f"{label} {value:,.2f}"
+            if currency == "CNY":
+                combined[key] += value
+            elif book is not None and value:
+                converted_value = exchange.to_cny(value, currency, book)
+                if converted_value is None:
+                    missing.add(currency)
+                else:
+                    converted = True
+                    combined[key] += converted_value
+                    text += exchange.conversion_suffix(converted_value)
+            parts.append(text)
+        captions.append("   ".join(parts))
+    note = ""
+    if foreign:
+        if book is None:
+            note = "（汇率不可用，未折算非人民币金额）"
+        elif converted:
+            totals_text = []
+            if side != "expense":
+                totals_text.append(f"收入 {exchange.money(combined['income'])}")
+            if side != "income":
+                totals_text.append(f"净支出 {exchange.money(combined['net_expense'])}")
+            if side is None:
+                totals_text.append(f"结余 {exchange.money(combined['balance'])}")
+            note = exchange.rate_note(book, foreign)
+            if missing:
+                note += f" · 缺 {', '.join(sorted(missing))} 汇率"
+            captions.append("全部折合人民币   " + "   ".join(totals_text)
+                            + (f"   · {note}" if note else ""))
+            note = ""
+        elif missing:
+            note = f"（缺少 {', '.join(sorted(missing))} 汇率，未折算）"
+    return captions, note
+
+
+def transaction_totals_text(totals, book):
+    """Build transaction summary captions plus an optional conversion note."""
+    captions = []
+    foreign = [currency for currency in totals if currency != "CNY"]
+    fields = (("income", "收入"), ("expense", "支出"), ("refund", "退款"),
+              ("reimbursement", "报销"), ("net_expense", "净支出"), ("balance", "结余"))
+    combined = {key: Decimal(0) for key, _ in fields}
+    missing, converted = set(), False
+    for currency, amounts in sorted(totals.items()):
+        income = amounts["income"]
+        expense = amounts["expense"]
+        refund = amounts["refund"]
+        reimbursement = amounts["reimbursement"]
+        net_expense = expense - refund - reimbursement
+        values = {"income": income, "expense": expense, "refund": refund,
+                  "reimbursement": reimbursement, "net_expense": net_expense,
+                  "balance": income - net_expense}
+        parts = []
+        for key, label in fields:
+            value = Decimal(decimal_text(values[key]))
+            text = f"{label} {value:,.2f}"
+            if currency == "CNY":
+                combined[key] += value
+            elif book is not None and value:
+                converted_value = exchange.to_cny(value, currency, book)
+                if converted_value is None:
+                    missing.add(currency)
+                else:
+                    converted = True
+                    combined[key] += converted_value
+                    text += exchange.conversion_suffix(converted_value)
+            parts.append(text)
+        captions.append(f"{currency}  " + "   ".join(parts))
+    note = ""
+    if foreign:
+        if book is None:
+            note = "（汇率不可用，未折算非人民币金额）"
+        elif converted:
+            totals_text = [f"{label} {exchange.money(combined[key])}" for key, label in fields]
+            note = exchange.rate_note(book, foreign)
+            if missing:
+                note += f" · 缺 {', '.join(sorted(missing))} 汇率"
+            captions.append("全部折合人民币   " + "   ".join(totals_text)
+                            + (f"   · {note}" if note else ""))
+            note = ""
+        elif missing:
+            note = f"（缺少 {', '.join(sorted(missing))} 汇率，未折算）"
+    return captions, note
+
+
+def summary_label(parent, variable):
+    """A wrapping summary label that follows the page width."""
+    label = ttk.Label(parent, textvariable=variable, style="Total.TLabel",
+                      wraplength=800, justify="left")
+    label.pack(anchor="w", fill="x", pady=(2, 8))
+
+    def resize(event):
+        label.configure(wraplength=max(320, event.width - 24))
+
+    parent.bind("<Configure>", resize, add="+")
+    return label
 
 
 def clearable_entry(parent, variable, width, *, on_clear=None):
@@ -341,9 +461,12 @@ def save_unassociated(database, event_ids, *, allow_unlink):
             for event_id in (rule["receipt"], rule["expense"]):
                 record = db.execute("SELECT kind, category, rule FROM events WHERE id = ?", (event_id,)).fetchone()
                 if event_id == rule["receipt"] or record["rule"] == "人工确认原支出":
-                    decisions.setdefault("classify", {})[event_id] = {
-                        "kind": record["kind"], "category": record["category"],
-                    }
+                    classification = decisions.setdefault("classify", {}).setdefault(event_id, {})
+                    classification["kind"] = record["kind"]
+                    if event_id == rule["receipt"]:
+                        classification.setdefault("category", record["category"])
+                    else:
+                        classification["category"] = record["category"]
         if "links" in decisions:
             decisions["links"] = remaining
     decisions["unassociated"] = sorted(set(decisions.get("unassociated", [])) | event_ids)
@@ -390,6 +513,7 @@ def save_transaction_edits(database, edits, *, allow_unlink=False):
         meta = dict(db.execute("SELECT key, value FROM metadata"))
         decisions = json.loads(meta["decisions"])
         classify = decisions.setdefault("classify", {})
+        receipt_categories = linked_receipt_categories(db)
         current = {}
         for event_id, edit in edits.items():
             unsupported = set(edit) - set(EDIT_FIELDS)
@@ -418,10 +542,11 @@ def save_transaction_edits(database, edits, *, allow_unlink=False):
         row = current[event_id]
         rule = dict(classify.get(event_id) or {})
         rule.update({key: value for key, value in edit.items() if key in EDIT_FIELDS})
-        # A refund or reimbursement link can rewrite the stored rule's type, so unchecked
-        # type fields follow the effective values the transaction list actually showed.
+        # A link can determine the current type and displayed category of a receipt.
+        # Keep its own category for use when the link is removed.
         rule["kind"] = edit.get("kind", row["kind"])
-        rule["category"] = edit.get("category", row["category"])
+        own_category = rule.get("category", row["category"]) if event_id in receipt_categories else row["category"]
+        rule["category"] = edit.get("category", own_category)
         rule["manual_override"] = True
         if rule["kind"] == "excluded" and not str(rule.get("note", "")).strip():
             raise ValueError(f"不计收支的交易需要填写备注：{event_id}")
@@ -531,14 +656,16 @@ class EditTransactionDialog(ConfirmationDialog):
 
     def body(self, master):
         self.kind = tk.StringVar(master, KINDS[self.row["kind"]])
-        self.category = tk.StringVar(master, self.row["category"])
+        follows_expense = "own_category" in self.row
+        self.category = tk.StringVar(master, self.row.get("own_category", self.row["category"]))
         self.party = tk.StringVar(master, self.row["counterparty"])
         self.description = tk.StringVar(master, self.row["description"])
         self.note = tk.StringVar(master, self.row.get("review_note", ""))
         fields = [
             ("交易类型", ttk.Combobox(master, textvariable=self.kind, values=tuple(KINDS.values()),
                                      state="readonly", width=27)),
-            ("分类", ttk.Combobox(master, textvariable=self.category, values=self.categories, width=27)),
+            ("解除关联后的分类" if follows_expense else "分类",
+             ttk.Combobox(master, textvariable=self.category, values=self.categories, width=27)),
             ("交易对方", clearable_entry(master, self.party, 29)[0]),
             ("说明", clearable_entry(master, self.description, 29)[0]),
             ("备注", clearable_entry(master, self.note, 29)[0]),
@@ -546,6 +673,10 @@ class EditTransactionDialog(ConfirmationDialog):
         for index, (label, widget) in enumerate(fields):
             ttk.Label(master, text=label).grid(row=index, column=0, sticky="w", padx=8, pady=5)
             widget.grid(row=index, column=1, sticky="w", padx=8, pady=5)
+        if follows_expense:
+            ttk.Label(master, text=f"当前分类为「{self.row['category']}」，随原支出更新。",
+                      style="Muted.TLabel", wraplength=360).grid(
+                row=len(fields), column=0, columnspan=2, sticky="w", padx=8, pady=(4, 0))
         return fields[0][1]
 
     def validate(self):
@@ -599,6 +730,10 @@ class BatchEditTransactionDialog(ConfirmationDialog):
         ttk.Label(master, text="勾选但留空会清空该字段；交易类型和分类不能清空。",
                   style="Muted.TLabel").grid(row=len(self.fields) + 1, column=0, columnspan=2,
                                              sticky="w", padx=8, pady=(6, 2))
+        if any("own_category" in row for row in self.rows):
+            ttk.Label(master, text="已关联回款的当前分类随原支出更新。修改回款自身分类会在解除关联后生效。",
+                      style="Muted.TLabel", wraplength=360).grid(
+                row=len(self.fields) + 2, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 0))
         return self.widgets["kind"]
 
     def toggle(self, key):
@@ -767,6 +902,11 @@ class LedgerWindow:
         self.totals = tk.StringVar(root)
         self.transaction_totals = tk.StringVar(root)
         self.chart_note = tk.StringVar(root)
+        self._rate_book = None
+        self._rate_fetching = False
+        self._rate_attempted = False
+        self._rate_retry_at = None
+        self._rate_queue = queue.Queue()
         root.title("收支账本")
         width = min(1140, root.winfo_screenwidth() - 48)
         height = min(760, root.winfo_screenheight() - 94)
@@ -909,7 +1049,7 @@ class LedgerWindow:
         self.field(bar, "report", "category", "分类", ALL, self.categories, 18)
         ttk.Button(bar, text="查询", style="Accent.TButton", command=lambda: self.refresh("report")).pack(
             side="left", anchor="s")
-        ttk.Label(page, textvariable=self.totals, style="Total.TLabel").pack(anchor="w", pady=(2, 8))
+        summary_label(page, self.totals)
         self.add_table("report", page)
 
     def create_transactions(self):
@@ -931,7 +1071,7 @@ class LedgerWindow:
             ttk.Button(actions, text=label, command=command).pack(side="left", padx=(0, 8))
         ttk.Label(actions, text="Ctrl / Shift 多选可批量编辑", style="Muted.TLabel").pack(
             side="left", padx=(4, 0))
-        ttk.Label(page, textvariable=self.transaction_totals, style="Total.TLabel").pack(anchor="w", pady=(2, 8))
+        summary_label(page, self.transaction_totals)
         table = self.add_table("transactions", page)
         table.tree.configure(selectmode="extended")
         table.tree.bind("<Double-1>", lambda event: self.double_click(event, "transactions"))
@@ -1043,6 +1183,74 @@ class LedgerWindow:
             if self.active_page and self.active_page != page:
                 self.status.set(previous_status)
 
+    def rate_book(self):
+        """Return cached rates immediately; refresh stale rates in the background."""
+        now = datetime.now(timezone.utc)
+        if self._rate_book is not None:
+            if now - self._rate_book.fetched_at <= exchange.MAX_AGE:
+                return self._rate_book
+            if self._rate_fetching or (self._rate_retry_at and now < self._rate_retry_at):
+                return self._rate_book
+        path = self.database.parent / "exchange_rates.json"
+        cached = exchange.read_cache(path)
+        if cached is not None:
+            self._rate_book = cached
+            if cached.stale and not self._rate_fetching:
+                self._rate_fetching = True
+                self._rate_retry_at = now + timedelta(minutes=10)
+                threading.Thread(target=self._refresh_rates, args=(path,), daemon=True).start()
+                self.root.after(100, self._poll_rates)
+            return cached
+        if self._rate_attempted:
+            return self._rate_book
+        self._rate_attempted = True
+        self._rate_retry_at = now + timedelta(minutes=10)
+        previous = self.status.get()
+        self.status.set("正在获取汇率…")
+        self.root.configure(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            fetched = exchange.fetch_rates(path)
+        finally:
+            self.root.configure(cursor="")
+            self.status.set(previous)
+        if fetched is not None:
+            self._rate_book = fetched
+            return fetched
+        return self._rate_book
+
+    def _refresh_rates(self, path):
+        """Run only network/file I/O; the main thread polls the queue."""
+        try:
+            fetched = exchange.fetch_rates(path)
+        except Exception:
+            fetched = None
+        self._rate_queue.put(fetched)
+
+    def _poll_rates(self):
+        try:
+            fetched = self._rate_queue.get_nowait()
+        except queue.Empty:
+            try:
+                if self.root.winfo_exists():
+                    self.root.after(100, self._poll_rates)
+            except tk.TclError:
+                pass
+            return
+        self._rate_fetching = False
+        if fetched is None:
+            return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self._rate_book = fetched
+        self._rate_retry_at = None
+        for page in ("report", "transactions"):
+            if page in self.loaded_pages:
+                self.refresh(page, preserve=True, use_applied=True)
+
     def load_report(self, db):
         get = lambda key: self.get("report", key)
         args = Namespace(**self.scope("report"), by=GROUPS[get("by")], basis=BASIS[get("basis")],
@@ -1072,16 +1280,10 @@ class LedgerWindow:
             amounts = totals[row["currency"]]
             amounts[0] += Decimal(row["income"])
             amounts[1] += Decimal(row["net_expense"])
-        captions = []
-        for currency, (income, expense) in totals.items():
-            parts = [currency]
-            if args.side != "expense":
-                parts.append(f"收入 {income:,.2f}")
-            if args.side != "income":
-                parts.append(f"净支出 {expense:,.2f}")
-            if args.side is None:
-                parts.append(f"结余 {income - expense:,.2f}")
-            captions.append("   ".join(parts))
+        book = self.rate_book() if any(currency != "CNY" for currency in totals) else None
+        captions, note = report_totals_text(totals, args.side, book)
+        if note:
+            captions.append(note)
         self.totals.set("\n".join(captions) or "当前筛选没有收支记录")
         self.tables["report"].fill(columns, [{**r, "side": DIRECTIONS.get(r.get("side"))} for r in rows])
         pending = db.execute("SELECT COUNT(*) FROM events WHERE kind = 'pending'").fetchone()[0]
@@ -1092,23 +1294,16 @@ class LedgerWindow:
         kinds = {label: key for key, label in KINDS.items()}
         args = Namespace(**self.scope("transactions"), kind=kinds.get(get("kind")),
                          search=get("search") or None, amount=minor(get("amount")) if get("amount") else None)
-        rows = ledger.transactions(db, args)
+        rows = ledger.transactions(db, args, include_own_category=True)
         ids = {row["id"] for row in rows}
         totals = {row["currency"]: Counter() for row in rows}
         for item in entries(db, {"refund": "net", "reimbursement": "net"}):
             if item.event_id in ids:
                 totals[item.currency][item.bucket] += item.amount
-        captions = []
-        for currency, amounts in sorted(totals.items()):
-            income = amounts["income"]
-            expense = amounts["expense"]
-            refund = amounts["refund"]
-            reimbursement = amounts["reimbursement"]
-            net_expense = expense - refund - reimbursement
-            parts = (("收入", income), ("支出", expense), ("退款", refund), ("报销", reimbursement),
-                     ("净支出", net_expense), ("结余", income - net_expense))
-            captions.append(f'{currency}  ' + "   ".join(
-                f"{name} {Decimal(decimal_text(value)):,.2f}" for name, value in parts))
+        book = self.rate_book() if any(currency != "CNY" for currency in totals) else None
+        captions, note = transaction_totals_text(totals, book)
+        if note:
+            captions.append(note)
         self.transaction_totals.set("当前明细 · 净收支口径\n" + "\n".join(captions)
                                     if captions else "当前筛选没有交易")
         self.show_records("transactions", rows)

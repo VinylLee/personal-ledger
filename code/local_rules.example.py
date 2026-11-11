@@ -12,3 +12,8 @@ FOOD_CONTEXT_KEYWORD = ""
 KEYWORD_IGNORE_TERMS = ()
 COUNTERPARTY_WATER_RULE = "交易对方规则"
 LANDLORD_RULE = "交易对方规则"
+
+
+def category_for_record(record):
+    """Return a local category or None. Manual classifications take precedence."""
+    return None

@@ -14,9 +14,10 @@ from pathlib import Path
 
 from accounting import (
     DEFAULT_REIMBURSEMENT_TOLERANCE, KINDS, apply_classifications, identify_internal_transfers, link_adjustments,
-    apply_counterparty_rules, merge_bank_records, normalize_category, recover_closed_purchases, set_classification,
+    apply_counterparty_rules, apply_local_category_rule, merge_bank_records, normalize_category,
+    recover_closed_purchases, set_classification,
 )
-from reports import decimal_text, summarize
+from reports import decimal_text, linked_receipt_categories, summarize
 from sources import json_text, load_statements, minor, select_events
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -244,6 +245,10 @@ def build(args):
                     raise ValueError(f"编辑的交易信息必须是文字：{event_id}")
                 setattr(record, field, rule[field])
 
+    for event_id, record in events.items():
+        if event_id not in classifications:
+            apply_local_category_rule(record)
+
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".ledger-", dir=output.parent) as folder:
         draft = Path(folder) / "ledger.sqlite3"
@@ -292,26 +297,40 @@ def report(db, args):
                       "reimbursement": args.reimbursements or args.basis})
 
 
-def transactions(db, args):
+def transactions(db, args, *, include_own_category=False):
     rows = db.execute("""
         SELECT * FROM events
         WHERE (? IS NULL OR kind = ? OR (kind = 'pending' AND direction = ?))
           AND (? IS NULL OR day >= ?) AND (? IS NULL OR day <= ?)
-          AND (? IS NULL OR currency = ?) AND (? IS NULL OR category = ?)
+          AND (? IS NULL OR currency = ?)
           AND (? IS NULL OR amount_minor = ?)
         ORDER BY day, occurred_at, id
     """, (args.kind, args.kind, {"income": "in", "expense": "out"}.get(args.kind),
           args.start, args.start, args.end, args.end,
-          args.currency, args.currency, args.category, args.category, args.amount, args.amount))
+          args.currency, args.currency, args.amount, args.amount))
     decisions = json.loads(db.execute("SELECT value FROM metadata WHERE key='decisions'").fetchone()[0])
     classifications = decisions.get("classify", {})
-    return [{**dict(row), "amount": decimal_text(row["amount_minor"]),
-             "review_note": classifications.get(row["id"], {}).get("note", "")} for row in rows
-            if not args.search or any(args.search.casefold() in value.casefold() for value in (
-                *(row[field] for field in ("id", "counterparty", "description", "source_type",
-                                           "order_id", "merchant_order_id")),
-                classifications.get(row["id"], {}).get("note", ""),
-            ))]
+    receipt_categories = linked_receipt_categories(db)
+    search = args.search.casefold() if args.search else ""
+    result = []
+    for row in rows:
+        event_id = row["id"]
+        category = receipt_categories.get(event_id, row["category"])
+        if args.category is not None and args.category != category:
+            continue
+        classification = classifications.get(event_id, {})
+        note = classification.get("note", "")
+        if search and not any(search in value.casefold() for value in (
+            *(row[field] for field in ("id", "counterparty", "description", "source_type",
+                                       "order_id", "merchant_order_id")), note,
+        )):
+            continue
+        event = {**dict(row), "category": category, "amount": decimal_text(row["amount_minor"]),
+                 "review_note": note}
+        if include_own_category and event_id in receipt_categories:
+            event["own_category"] = classification.get("category", row["category"])
+        result.append(event)
+    return result
 
 
 def review(db, args):
@@ -349,11 +368,13 @@ def review(db, args):
         """, (args.event, args.event))
     elif args.status == "unlinked":
         rows = db.execute("""
-            SELECT e.id, e.day, e.source, e.currency, e.counterparty, e.description, e.category,
+            SELECT e.id, e.day, e.source, e.currency, e.counterparty, e.description,
+                   COALESCE(spend.category, e.category) AS category,
                    e.amount_minor AS receipt_amount_minor,
                    e.amount_minor - COALESCE(SUM(l.amount_minor), 0) AS amount_minor
             FROM events e LEFT JOIN links l
               ON l.first_id = e.id AND l.status = 'confirmed' AND l.relation = e.kind
+            LEFT JOIN events spend ON spend.id = l.second_id
             WHERE e.kind = ? AND (? IS NULL OR e.id = ?)
               AND NOT EXISTS (
                   SELECT 1 FROM metadata m, json_each(m.value, '$.unassociated') j
@@ -381,13 +402,15 @@ def trace(db, event_id):
     event = db.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
     if event is None:
         raise ValueError(f"找不到交易：{event_id}")
+    event = dict(event)
+    event["category"] = linked_receipt_categories(db).get(event_id, event["category"])
     rows = db.execute("""
         SELECT s.path, r.line_no, r.role, r.match_rule, r.raw_json
         FROM source_rows r JOIN sources s ON s.id = r.source_id WHERE r.event_id = ?
         ORDER BY r.role != 'primary', s.path, r.line_no
     """, (event_id,)).fetchall()
     return {
-        "event": dict(event),
+        "event": event,
         "review_note": json.loads(db.execute(
             "SELECT value FROM metadata WHERE key='decisions'").fetchone()[0]
         ).get("classify", {}).get(event_id, {}).get("note", ""),

@@ -27,11 +27,12 @@ FOOD_CONTEXT_KEYWORD = getattr(local_rules, "FOOD_CONTEXT_KEYWORD", "")
 KEYWORD_IGNORE_TERMS = getattr(local_rules, "KEYWORD_IGNORE_TERMS", ())
 COUNTERPARTY_WATER_RULE = getattr(local_rules, "COUNTERPARTY_WATER_RULE", "交易对方规则")
 LANDLORD_RULE = getattr(local_rules, "LANDLORD_RULE", "交易对方规则")
+CATEGORY_FOR_RECORD = getattr(local_rules, "category_for_record", None)
 
 DEFAULT_REIMBURSEMENT_TOLERANCE = Decimal("5")
 
 CATEGORIES = {
-    "交通出行": "交通", "爱车养车": "车辆", "餐饮美食": "餐饮",
+    "交通出行": "交通", "爱车养车": "交通", "餐饮美食": "餐饮",
     "生活服务": "生活服务", "日用百货": "购物", "公益捐赠": "捐赠",
     "充值缴费": "生活缴费", "医疗健康": "医疗", "文化休闲": "文娱",
     "商业服务": "商业服务",
@@ -51,10 +52,13 @@ SELF_NAME_PATTERNS = tuple(
 KINDS = {"expense", "income", "refund", "reimbursement", "advance",
          "internal", "investment", "failed", "pending", "excluded"}
 TRANSFER_CATEGORY_ALIASES = {"本人账户划转", "账户资金划转"}
+CATEGORY_ALIASES = {"车辆": "交通", "电瓶车充电": "交通"}
 
 
 def normalize_category(category):
-    return "账户划转" if category in TRANSFER_CATEGORY_ALIASES else category
+    if category in TRANSFER_CATEGORY_ALIASES:
+        return "账户划转"
+    return CATEGORY_ALIASES.get(category, category)
 
 
 def keyword_match(category, text, context):
@@ -156,6 +160,17 @@ def classify(record):
 def set_classification(record):
     record.kind, record.category, record.rule = classify(record)
     apply_counterparty_rules(record)
+
+
+def apply_local_category_rule(record):
+    """Apply a local category label after the transaction type and links are settled."""
+    if (CATEGORY_FOR_RECORD is None or record.kind in {"failed", "excluded", "investment"}
+            or record.category == "跨渠道重复待确认"):
+        return
+    category = CATEGORY_FOR_RECORD(record)
+    if category and (category := normalize_category(category)) != record.category:
+        record.category = category
+        record.rule = f"{record.rule}；本机分类规则"
 
 
 def apply_counterparty_rules(record):

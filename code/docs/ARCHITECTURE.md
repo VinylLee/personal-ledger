@@ -2,7 +2,7 @@
 
 ## 1. 总览
 
-单机离线应用：Python 3.12 + SQLite + Tkinter。没有服务端、没有账号体系，账本文件保存在本机 `output/收支账本.sqlite3`。
+本地优先的单机应用：Python 3.12 + SQLite + Tkinter。没有服务端、没有账号体系，账本文件保存在本机 `output/收支账本.sqlite3`。唯一可选的网络访问是桌面界面的汇率折算（只发送币种代码，不发送账本数据）。
 
 ```
 交易记录/26.11.11/*.csv|xlsx|xls        output/收支账本.sqlite3
@@ -24,6 +24,11 @@ accounting 规则链（分类、去重、划转、退款/报销关联）── l
         ▼              ▼              ▼
    terminal.py     reports.py     ledger_gui.py (Tkinter)
    CLI 表格/CSV/JSON  统计汇总        桌面四页签
+                                        │ 仅汇总行、仅非 CNY
+                                        ▼
+                              exchange.py ──► output/exchange_rates.json
+                                        │        （24h 缓存，过期先用旧值）
+                                        └──────► 公开汇率接口（可选）
 ```
 
 两条使用路径：
@@ -39,12 +44,13 @@ accounting 规则链（分类、去重、划转、退款/报销关联）── l
 | `accounting.py` | 自动分类、交易对方规则、关闭订单恢复、跨渠道重复合并、账户划转识别、退款/报销候选匹配 | `classify`、`set_classification`、`merge_bank_records`、`link_adjustments` |
 | `ledger.py` | 建库、表结构、复核规则读写、只读查询、完整性审计 | `build`、`report`、`transactions`、`review`、`trace`、`audit` |
 | `reports.py` | 把 `events` 和已确认关联折算成统计条目，按维度汇总 | `entries`、`summarize`、`decimal_text` |
+| `exchange.py` | 获取并缓存公开汇率，提供 CNY 换算和展示辅助；只被桌面汇总标签使用 | `read_cache`、`fetch_rates`、`to_cny`、`rate_note` |
 | `terminal.py` | 命令行的 rich 表格输出 | `display` |
 | `charts.py` | matplotlib 饼图 + 柱状图 | `LedgerCharts.draw` |
 | `ledger_gui.py` | Tkinter 界面、复核对话框、写操作入口 | `LedgerWindow`、`save_*`、`main` |
 | `open_ledger.cmd` | Windows 双击启动 | — |
 
-依赖：`openpyxl`（微信 xlsx）、`xlrd`（建行 xls）、`rich`（终端表格）、`matplotlib`（图表）。
+依赖：`openpyxl`（微信 xlsx）、`xlrd`（建行 xls）、`rich`（终端表格）、`matplotlib`（图表）。汇率使用标准库 `urllib.request`，没有新增第三方依赖。
 
 **本地私有规则**：`accounting.py` 会尝试导入同目录的 `local_rules.py`，读取 `SELF_NAMES`（本人户名列表）。命中这些户名的流水归为「账户划转」。该文件含个人身份信息，已加入 `.gitignore`；仓库只提供 `local_rules.example.py` 模板。文件不存在时 `SELF_NAMES` 为空，规则不生效，其余功能不受影响。
 
@@ -156,7 +162,7 @@ accounting 规则链（分类、去重、划转、退款/报销关联）── l
 
 容易踩的坑：
 
-1. **规则里的类型可能过期。** `link_adjustments` 会在人工关联后把回款的 `kind` 改为 `refund/reimbursement`，但 `classify` 里可能还留着旧的 `income/pending`。任何「只改部分字段」的保存都要以数据库中的有效 `kind/category` 为基准，不能直接沿用旧规则（`save_transaction_edits` 已按此处理）。
+1. **规则里的类型可能过期。** `link_adjustments` 会在人工关联后把回款的 `kind` 改为 `refund/reimbursement`，但 `classify` 里可能还留着旧的 `income/pending`。部分字段编辑以数据库中的有效类型为基准。已关联回款的自身分类优先取保存的人工分类，供解除关联后使用。
 2. **`unassociated` 与 `links` 互斥。** 同一笔交易不能既标记无关联又出现在关联里；`link_adjustments` 会报错。
 3. **确认交易性质时应合并旧规则，而不是整体替换。** 否则此前批量设置的说明、备注会被清掉（`save_pending_classifications` 已改为合并）。
 4. 新增规则键时，必须同步 `ledger.read_decisions` 的白名单、`build` 的应用逻辑、界面的保存/导出函数和用户 README。
@@ -165,9 +171,11 @@ accounting 规则链（分类、去重、划转、退款/报销关联）── l
 
 `reports.entries(db, actions)` 把每笔 event 折算成统计条目；`summarize` 再按日期/币种/方向/分类聚合。`actions` 是 `{"refund": 模式, "reimbursement": 模式}`。
 
+确认关联的退款和报销在读取时使用原支出的分类。交易明细筛选和报表均使用该分类，`events.category` 继续记录回款自身的分类，供解除关联后使用。
+
 | 模式 | 退款/报销回款如何处理 |
 |---|---|
-| `net`（默认） | 在到账日按原支出分类冲减支出；未分摊部分单列为回款分类 |
+| `net`（默认） | 回款全额在到账日冲减支出，已确认关联的回款整笔使用原支出分类 |
 | `gross` | 保留原支出，排除回款流水 |
 | `pure` | 在原支出日回溯扣除已确认分摊；`advance` 整体排除 |
 | `cash` | 回款作为单独类型的流入，在 `ordinary_income` 中保留普通收入 |
@@ -208,7 +216,19 @@ accounting 规则链（分类、去重、划转、退款/报销关联）── l
 - 类型变更校验流水方向；与已确认退款/报销关联冲突时统一确认一次并解除关联。
 - 未勾选类型/分类时，以数据库中的有效值写入规则，避免旧规则类型过期。
 
-## 9. 扩展点
+## 9. 汇率折算（仅桌面汇总）
+
+目标：只在「收支报表」和「交易明细」的汇总标签里，把非人民币金额折算成人民币；不改单笔明细、图表、命令行报表、数据库或 `reports.py`。
+
+- **触发条件**：当前结果包含非 CNY 币种才调用 `LedgerWindow.rate_book()`；只有 CNY 的视图不联网、不显示折算。
+- **汇率来源**：`https://open.er-api.com/v6/latest/CNY`，返回以 CNY 为基准的汇率表。缓存写在账本同目录的 `exchange_rates.json`（默认 `output/`，已被 `.gitignore` 忽略），有效期 24 小时。
+- **刷新策略**：先读缓存并立即显示；缓存过期时先用旧值，标签注明「汇率缓存 YYYY-MM-DD」，同时启动后台线程调用 `exchange.fetch_rates`。只有完全没有缓存时才同步请求（超时 5 秒）。后台线程只做网络/文件 I/O 并把结果放入队列，主线程用 `root.after` 轮询后重绘当前页；不要在后台线程直接调用 Tk。
+- **换算方向**：缓存中的 `rates["USD"]` 表示 1 CNY 可换多少 USD，因此 `CNY = 外币金额 / rate`。全部用 `Decimal`，显示按 `ROUND_HALF_UP` 保留两位；合计先用未舍入值累加，最后统一格式化。
+- **缺失与失败**：缺少某币种汇率时该行不显示 `≈`，并在合计行注明「缺 XXX 汇率」；请求失败且无缓存时保留原标签并提示「汇率不可用，未折算非人民币金额」。任何网络/解析错误都不能影响其他功能。
+- **格式**：非 CNY 行在每个金额后追加「（≈ 人民币 X）」；末尾增加「全部折合人民币 … · 汇率 YYYY-MM-DD · 1 USD ≈ X CNY」。
+- **隐私**：请求固定为 CNY 基准的公开汇率表，不包含账本、交易、账户或筛选条件。缓存只含公开汇率。
+
+## 10. 扩展点
 
 - **新增交易类型**：同步 `accounting.KINDS`、`ledger_gui.KINDS`、`terminal.KINDS`，检查 `reports.entries`、`ledger.audit` 的统计分支和方向校验。
 - **新增账单来源**：在 `sources.load_statements` 增加文件名识别和 `normalize` 分支，补齐必需列校验。
