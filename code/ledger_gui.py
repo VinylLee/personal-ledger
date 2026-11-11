@@ -20,7 +20,8 @@ from tkinter.scrolledtext import ScrolledText
 
 import exchange
 import ledger
-from reports import PENDING_DIRECTIONS, decimal_text, entries, filtered_entries, linked_receipt_categories
+from reports import (PENDING_DIRECTIONS, confirmed_adjustments as report_adjustments, decimal_text, entries,
+                     filtered_entries, linked_receipt_categories)
 from sources import minor
 
 ALL = "全部"
@@ -1082,6 +1083,14 @@ class LedgerWindow:
         self.field(bar, "transactions", "amount", "原金额", "", width=12)
         ttk.Button(bar, text="查询", style="Accent.TButton", command=lambda: self.refresh("transactions")).pack(
             side="left", anchor="s")
+        bar = self.toolbar(self.transaction_filters)
+        for key, label in (("hide_reimbursements", "隐藏报销回款及已报销支出"),
+                           ("hide_refunds", "隐藏退款回款及已退款支出")):
+            variable = tk.BooleanVar(bar, False)
+            self.forms["transactions"][key] = variable
+            ttk.Checkbutton(bar, text=label, variable=variable,
+                            command=lambda: self.refresh("transactions", preserve=True)).pack(
+                side="left", padx=(0, 12))
         self.chart_detail_bar = ttk.Frame(page)
         ttk.Button(self.chart_detail_bar, text="清除图表筛选", command=self.clear_chart_detail).pack(
             side="right", padx=(10, 0))
@@ -1092,14 +1101,8 @@ class LedgerWindow:
                                ("编辑交易", self.edit_transaction),
                                ("确认无关联", lambda: self.mark_unassociated("transactions"))):
             ttk.Button(actions, text=label, command=command).pack(side="left", padx=(0, 8))
-        hide_reimbursements = tk.BooleanVar(actions, False)
-        self.forms["transactions"]["hide_reimbursements"] = hide_reimbursements
-        self.hide_reimbursements_button = ttk.Checkbutton(
-            actions, text="隐藏报销回款及已报销支出", variable=hide_reimbursements,
-            command=lambda: self.refresh("transactions", preserve=True))
-        self.hide_reimbursements_button.pack(side="left", padx=(0, 8))
-        self.transaction_edit_hint = ttk.Label(actions, text="Ctrl / Shift 多选可批量编辑", style="Muted.TLabel")
-        self.transaction_edit_hint.pack(side="left", padx=(4, 0))
+        ttk.Label(actions, text="Ctrl / Shift 多选可批量编辑", style="Muted.TLabel").pack(
+            side="left", padx=(4, 0))
         summary_label(page, self.transaction_totals)
         table = self.add_table("transactions", page)
         table.tree.configure(selectmode="extended")
@@ -1202,7 +1205,6 @@ class LedgerWindow:
                                     categories=target.categories if target.categories is not None else scope.categories)
         self.hide_chart_tooltip()
         self.transaction_filters.pack_forget()
-        self.hide_reimbursements_button.pack_forget()
         self.chart_detail_bar.pack(fill="x", pady=(0, 10), before=self.transaction_actions)
         self.refresh("transactions")
         self.tabs.select(self.tables["transactions"].master)
@@ -1211,7 +1213,6 @@ class LedgerWindow:
         self.chart_detail = None
         self.chart_detail_bar.pack_forget()
         self.transaction_filters.pack(fill="x", before=self.transaction_actions)
-        self.hide_reimbursements_button.pack(side="left", padx=(0, 8), before=self.transaction_edit_hint)
         self.refresh("transactions", use_applied=True)
 
     def change_review_type(self):
@@ -1385,6 +1386,7 @@ class LedgerWindow:
         args = Namespace(**self.scope("transactions"), kind=kinds.get(get("kind")),
                          search=get("search") or None, amount=minor(get("amount")) if get("amount") else None)
         rows = ledger.transactions(db, args, include_own_category=True)
+        hide_refunds = self.forms["transactions"]["hide_refunds"].get()
         if self.forms["transactions"]["hide_reimbursements"].get():
             reimbursed_ids = {
                 event_id for link in db.execute("""
@@ -1393,16 +1395,32 @@ class LedgerWindow:
                 """) for event_id in link
             }
             rows = [row for row in rows if row["kind"] != "reimbursement" and row["id"] not in reimbursed_ids]
-        ids = {row["id"] for row in rows}
-        totals = {row["currency"]: Counter() for row in rows}
-        for item in entries(db, {"refund": "net", "reimbursement": "net"}):
-            if item.event_id in ids:
-                totals[item.currency][item.bucket] += item.amount
+        refunded_ids = set()
+        if hide_refunds:
+            links = [link for link in report_adjustments(db) if link["relation"] == "refund"]
+            refund_receipts = {link["first_id"] for link in links}
+            refunded_ids = {link["second_id"] for link in links}
+            rows = [row for row in rows if row["kind"] != "refund" and row["id"] not in refund_receipts]
+        rows_by_id = {row["id"]: row for row in rows}
+        totals = defaultdict(Counter)
+        actions = {"refund": "pure" if hide_refunds else "net", "reimbursement": "net"}
+        for item in entries(db, actions):
+            row = rows_by_id.get(item.event_id)
+            if row is None:
+                continue
+            totals[item.currency][item.bucket] += item.amount
+            if item.event_id in refunded_ids:
+                row["amount"] = decimal_text(item.amount)
+                row["refund_remainder"] = True
+        rows = [row for row in rows if row["id"] not in refunded_ids or row.get("refund_remainder")]
+        for row in rows:
+            totals.setdefault(row["currency"], Counter())
         book = self.rate_book() if any(currency != "CNY" for currency in totals) else None
         captions, note = transaction_totals_text(totals, book)
         if note:
             captions.append(note)
-        self.transaction_totals.set("当前明细 · 净收支口径\n" + "\n".join(captions)
+        summary_title = "当前明细 · 退款后支出" if hide_refunds else "当前明细 · 净收支口径"
+        self.transaction_totals.set(summary_title + "\n" + "\n".join(captions)
                                     if captions else "当前筛选没有交易")
         self.show_records("transactions", rows)
         self.status.set(f"{len(rows)} 笔交易")
@@ -1537,6 +1555,8 @@ class LedgerWindow:
             elif row.get("kind") == "pending" or (page == "review" and "kind" not in row):
                 side = PENDING_DIRECTIONS.get(row["direction"])
                 row["type_label"] = "待复核" + KINDS.get(side, "")
+            elif row.get("refund_remainder"):
+                row["type_label"] = "差额支出"
             row["note"] = row["description"] or row.get("rule") or row.get("source_type")
             if row.get("review_note"):
                 row["note"] = f'{row["note"]}  ·  复核备注：{row["review_note"]}'
