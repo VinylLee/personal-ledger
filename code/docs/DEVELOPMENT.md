@@ -1,0 +1,183 @@
+# 开发与验证指南
+
+## 1. 环境
+
+项目使用 Conda 环境 `personal-ledger`（Python 3.12）。环境名和解释器路径因机器而异，先确认：
+
+```powershell
+conda env list
+conda activate personal-ledger
+python -m pip install -r code/requirements.txt
+```
+
+从项目根目录（`code/` 的上一级）运行以下命令。若本机没有该环境，任意 Python 3.10+ 装齐 `requirements.txt` 也可，但图表和中文界面的字体效果可能不同。
+
+可选：按本人姓名识别账户划转。复制模板并填写 `SELF_NAMES`：
+
+```powershell
+copy code\local_rules.example.py code\local_rules.py
+```
+
+`local_rules.py` 含真实姓名，已加入 `.gitignore`，不要提交；缺失时该规则自动禁用。
+
+## 2. 常用命令
+
+```powershell
+# 重建账本（默认输入 交易记录/26.11.11，输出 output/收支账本.sqlite3）
+python code/ledger.py build --start 2026-01-01 --end 2026-11-11
+
+# 完整性审计：源明细逐条核对、各统计维度总额对账
+python code/ledger.py audit
+
+# 查询
+python code/ledger.py report --by month
+python code/ledger.py transactions --search "关键词"
+python code/ledger.py review --type pending
+python code/ledger.py trace <交易编号>
+
+# 桌面界面
+python code/ledger_gui.py
+python code/ledger_gui.py --db 路径\其他账本.sqlite3
+```
+
+- `--db` 放在子命令之前。
+- `build --decisions 路径` 可沿用导出的复核规则；`--reimbursement-tolerance 3` 覆盖报销差额阈值。
+- 命令行 `--format csv|json` 便于给其他程序用；默认是中文表格。
+
+## 3. 测试策略
+
+**现状：没有自动化测试套件。** 修改后至少做下面三类验证：
+
+### 3.1 静态检查
+
+```powershell
+python -m py_compile code/ledger.py code/ledger_gui.py code/accounting.py code/sources.py code/reports.py code/charts.py code/terminal.py
+```
+
+### 3.2 无界面功能测试（必须用账本副本）
+
+界面逻辑和写操作都可以在没有窗口的情况下验证。**永远不要拿真实的 `output/收支账本.sqlite3` 做实验**，它是用户的真实账本。
+
+推荐的脚本骨架（放在系统临时目录，不要放进仓库）：
+
+```python
+import json, shutil, sys, tempfile
+from contextlib import closing
+from pathlib import Path
+
+ROOT = Path(r"<项目根目录>")
+CODE = ROOT / "code"
+sys.path.insert(0, str(CODE))
+import ledger, ledger_gui
+
+real = ROOT / "output" / "收支账本.sqlite3"
+folder = Path(tempfile.mkdtemp(prefix="ledger-test-"))
+db = folder / "ledger.sqlite3"
+shutil.copy(real, db)
+
+with closing(ledger.open_db(db)) as conn:
+    ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM events WHERE kind='expense' ORDER BY day LIMIT 2")]
+
+# 写操作：内部会整库重建，源账单必须还在 metadata.input_root 指向的位置
+ledger_gui.save_transaction_edits(db, {ids[0]: {"description": "测试说明"}})
+
+with closing(ledger.open_db(db)) as conn:
+    assert conn.execute("SELECT description FROM events WHERE id=?", (ids[0],)).fetchone()[0] == "测试说明"
+print("PASSED", folder)
+```
+
+要点：
+
+- `ledger.open_db` 是只读 URI，写操作请用 `ledger_gui.save_*` 或 `sqlite3.connect`。
+- `save_*` 会读取 `metadata.input_root` 重新解析源账单，所以副本必须能访问原始 `交易记录` 目录。
+- 写操作失败时账本不会被破坏（临时库 + 原子替换）。
+- `sqlite3.Row` 在连接关闭后仍可读取字段。
+
+### 3.3 界面冒烟测试
+
+不需要手动点界面就能发现 Tk 控件错误：
+
+```python
+import sys, tkinter as tk
+from pathlib import Path
+from pathlib import Path
+sys.path.insert(0, str(Path(r"<项目根目录>") / "code"))
+import ledger_gui
+
+root = tk.Tk()
+root.withdraw()  # 不显示窗口
+app = ledger_gui.LedgerWindow(root, Path(r"<项目根目录>") / "output" / "收支账本.sqlite3")
+root.update_idletasks()
+assert str(app.tables["transactions"].tree.cget("selectmode")) == "extended"
+root.destroy()
+```
+
+对话框是模态的（构造时进入 `wait_window`）。无界面测试时先替换：
+
+```python
+from tkinter import simpledialog
+simpledialog.Dialog.wait_window = lambda self, window: None
+```
+
+注意 `messagebox.showerror` 在验证失败时会真的弹窗，测试失败路径前把它替换为空函数。
+
+Tk 控件状态用 `widget.state()` 或 `str(widget.cget("key"))` 判断；`cget` 可能返回 Tcl 对象，不要直接和字符串比较。
+
+### 3.4 改动后的回归清单
+
+根据改动范围选择：
+
+- 数据层：`build` 成功 + `audit` 通过（逐币种、逐维度对账）。
+- 报表：抽查 `report --by month/category`，核对收入、支出、退款、报销、净支出、结余。
+- 明细/复核：查询、排序、多选、刷新后选中与滚动位置是否保留。
+- 写操作：验证 `decisions` 内容、重建后的 `events` 字段、失败时原数据不变。
+- 界面：主窗口和涉及的对话框能否构造；按钮禁用状态是否符合当前页签。
+
+## 4. 修改检查清单
+
+### 4.1 改一处，记得查这几处
+
+| 改动 | 需要同步的位置 |
+|---|---|
+| 交易类型（kind） | `accounting.KINDS`、`ledger_gui.KINDS`、`terminal.KINDS`、`reports.entries`、`ledger.audit` 的统计 SQL、方向校验 |
+| `decisions` 新键 | `ledger.read_decisions` 白名单、`ledger.build` 应用逻辑、界面保存/导出、用户 README、本文档 |
+| 数据库字段 | `ledger.SCHEMA`、`EVENT_FIELDS`、`sources.Record`、`build` 插入、查询 SELECT、`audit` |
+| 新建界面页 | `create_<page>`、`load_<page>`、`LedgerWindow.__init__` 中的创建顺序；`refresh` 依赖命名约定 |
+| 新写操作 | 校验函数、`save_*`、`rebuild_with_decisions`、界面刷新与状态提示、失败回滚 |
+| 账单格式 | `sources.load_statements` 文件名识别、`normalize`、`read_rows`、必需列校验 |
+| 命令行参数 | `ledger.parser`、`main` 分派、用户 README |
+| 用户可见行为 | `README.md`、`docs/ARCHITECTURE.md`、`docs/DEVELOPMENT.md`、`docs/CHANGELOG.md` |
+
+### 4.2 写操作的三条硬规则
+
+1. **规则合并不要整体替换。** 部分字段编辑必须保留未修改字段；类型/分类要取数据库中的有效值（原因见 ARCHITECTURE 第 6 节）。
+2. **校验放在保存前。** 界面先拦截方向冲突、空分类、不计收支缺备注、重复候选；`save_*` 再做一次后端校验。
+3. **一次操作只重建一次。** 多笔修改先汇总成 `decisions`，最后调用一次 `rebuild_with_decisions`。
+
+## 5. 常见坑
+
+- **控制台中文乱码**：Windows 控制台是 GBK，而源码和输出是 UTF-8，`print` 看到乱码通常不是数据问题。用 `ascii()` 或直接查数据库确认。
+- **真实账本被误改**：测试一律复制 `output/收支账本.sqlite3` 到临时目录，并把副本路径传给 `--db`/函数。
+- **规则丢失风险**：`decisions` 只存在数据库里。做实验性重建前，先在复核页「导出复核规则」，或复制整个账本文件。
+- **`metadata.input_root` 失效**：账本记录了源账单的绝对路径。项目移动、源目录改名后，所有写操作都会失败，需要 `build --input 新路径` 重建。
+- **银行交易编号会变**：同一条银行流水只要原始行内容变了，`event_id` 就会变，旧人工规则会报「交易编号不存在」。这是设计使然，不要试图让编号对内容变化保持稳定。
+- **`Table.selected()` vs `selected_rows()`**：前者返回当前焦点/首个选中行，适合「查看原始流水」；后者返回全部选中行，适合批量操作。
+- **切页签自动刷新**：`tab_changed` 会比较数据库版本并重载。修改刷新逻辑时注意 `applied_forms`（查询条件）和 `view_state`（选中/滚动）的配合。
+- **模态对话框**：`simpledialog.Dialog.__init__` 会阻塞到窗口关闭；无界面测试要替换 `wait_window`。
+- **字符宽度**：界面是中文，表格列宽以像素计；新增列先对照现有 `Column` 宽度。
+- **`local_rules.py` 不入库**：真实姓名只写在这个本地文件里。不要把 `SELF_NAMES` 的具体值写回公开代码、README 或文档；测试时可以用虚构姓名临时验证。
+
+## 6. 代码约定
+
+- 沿用现有风格：4 空格缩进、单行约 110 字符、界面文案用中文、标识符用英文。
+- 规则计算层（`accounting`、`reports`）尽量写纯函数或不可变数据结构；`sources.Record` 在构建期是可变的，这是既有设计。
+- 金额只以整数分计算，展示时才用 `decimal_text`；不要用浮点数算钱。
+- 不要静默吞异常。界面写操作由 `save_review_change` 统一弹窗；命令行由 `main` 捕获 `ValueError` 等并退出。
+- 新增依赖前先确认是否必要；账单格式解析依赖 `xlrd`/`openpyxl`，不要引入 pandas。
+- 不要加 `print` 调试语句到生产代码；需要诊断时用现有状态栏或临时脚本。
+- 文档里的函数名、表名、参数名必须能在代码中搜到。
+
+## 7. 文档维护
+
+见 [README.md](README.md) 的「维护规则」。简而言之：**改行为就同步改文档，并在 CHANGELOG 追加一条**。本项目没有 git 历史，文档缺失意味着下一位开发者（或 Agent）只能靠猜。

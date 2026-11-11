@@ -1,0 +1,29 @@
+# 个人财务数据与原始账单（严禁入库）
+/output/
+/交易记录/
+*.sqlite3
+*.sqlite
+*.db
+
+# 本地私有规则（含真实姓名）
+code/local_rules.py
+local_rules.py
+
+# 复核规则导出
+复核规则.json
+*.decisions.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# 编辑器与系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
