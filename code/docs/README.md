@@ -14,7 +14,7 @@
 
 ## 维护规则（重要）
 
-本项目**不是 git 仓库**，没有提交历史可查，文档就是唯一的历史记录。因此：
+本项目已纳入 Git（远程 `VinylLee/personal-ledger`），但 `docs/CHANGELOG.md` 仍是主要的变更记录。因此：
 
 1. 任何影响行为、数据结构、命令行参数、`decisions` 格式或界面操作的修改，都必须在同一次改动里更新本目录文档。
 2. 架构或数据流变化改 `ARCHITECTURE.md`；命令、测试方法、易错点变化改 `DEVELOPMENT.md`；每次改动都在 `CHANGELOG.md` 追加一条。

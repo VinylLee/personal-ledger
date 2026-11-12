@@ -286,6 +286,54 @@ def open_db(path):
     return db
 
 
+REQUIRED_TABLES = frozenset({"metadata", "sources", "events", "source_rows", "links"})
+REQUIRED_METADATA = ("schema_version", "start", "end", "input_root", "decisions")
+
+
+def validate_database(path):
+    """Validate a ledger file read-only and return its metadata."""
+    path = Path(path).resolve()
+    if not path.exists():
+        raise ValueError(f"账本文件不存在：{path}")
+    if not path.is_file():
+        raise ValueError(f"所选路径不是文件：{path}")
+    try:
+        with closing(open_db(path)) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            missing = REQUIRED_TABLES - tables
+            if missing:
+                raise ValueError(f"不是收支账本：缺少数据表 {', '.join(sorted(missing))}")
+            metadata = dict(db.execute("SELECT key, value FROM metadata"))
+            missing_keys = [key for key in REQUIRED_METADATA if key not in metadata]
+            if missing_keys:
+                raise ValueError(f"账本 metadata 缺少：{', '.join(missing_keys)}")
+            if metadata["schema_version"] != "1":
+                raise ValueError(f"不支持的账本版本：{metadata['schema_version']}")
+            try:
+                date.fromisoformat(metadata["start"])
+                date.fromisoformat(metadata["end"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("账本日期范围无效") from exc
+            try:
+                decisions = json.loads(metadata["decisions"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("账本复核规则不是有效 JSON") from exc
+            if not isinstance(decisions, dict):
+                raise ValueError("账本复核规则格式无效")
+            if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ValueError("数据库完整性检查失败")
+            db.execute("SELECT DISTINCT currency FROM events").fetchall()
+            db.execute("SELECT DISTINCT category FROM events").fetchall()
+            return metadata
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if "locked" in message or "unable to open" in message:
+            raise ValueError("账本正被其他程序占用，或无法以只读方式打开") from exc
+        raise ValueError(f"不是有效的 SQLite 数据库：{exc}") from exc
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"不是有效的 SQLite 数据库：{exc}") from exc
+
+
 def report(db, args):
     bounds = dict(db.execute("SELECT key, value FROM metadata").fetchall())
     start, end = args.start or bounds["start"], args.end or bounds["end"]

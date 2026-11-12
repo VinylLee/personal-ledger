@@ -42,7 +42,7 @@ accounting 规则链（分类、去重、划转、退款/报销关联）── l
 |---|---|---|
 | `sources.py` | 识别四种账单格式、解析原始行、生成稳定交易编号、去重同一导出的重复行 | `load_statements`、`select_events`、`minor` |
 | `accounting.py` | 自动分类、交易对方规则、关闭订单恢复、跨渠道重复合并、账户划转识别、退款/报销候选匹配 | `classify`、`set_classification`、`merge_bank_records`、`link_adjustments` |
-| `ledger.py` | 建库、表结构、复核规则读写、只读查询、完整性审计 | `build`、`report`、`transactions`、`review`、`trace`、`audit` |
+| `ledger.py` | 建库、表结构、复核规则读写、只读查询、完整性审计、数据库校验 | `build`、`report`、`transactions`、`review`、`trace`、`audit`、`validate_database` |
 | `reports.py` | 把 `events` 和已确认关联折算成统计条目，按维度汇总 | `entries`、`summarize`、`decimal_text` |
 | `exchange.py` | 获取并缓存公开汇率，提供 CNY 换算和展示辅助；只被桌面汇总标签使用 | `read_cache`、`fetch_rates`、`to_cny`、`rate_note` |
 | `terminal.py` | 命令行的 rich 表格输出 | `display` |
@@ -231,7 +231,18 @@ accounting 规则链（分类、去重、划转、退款/报销关联）── l
 - **格式**：非 CNY 行在每个金额后追加「（≈ 人民币 X）」；末尾增加「全部折合人民币 … · 汇率 YYYY-MM-DD · 1 USD ≈ X CNY」。
 - **隐私**：请求固定为 CNY 基准的公开汇率表，不包含账本、交易、账户或筛选条件。缓存只含公开汇率。
 
-## 10. 扩展点
+## 10. 桌面界面的账本生命周期
+
+- **菜单**：窗口顶部「账本」菜单提供「导入新账单…」（Ctrl+N）、「选择数据库…」（Ctrl+O）、「重命名当前数据库…」（F2）和退出。
+- **导入新账单**：`filedialog.askdirectory` 选择目录后调用 `ledger.build(Namespace(db=新路径, input=目录, start=None, end=None, decisions=None))`。新账本放在当前数据库同目录，自动命名为 `<目录名>-YYYY-MM-DD.sqlite3`（同名追加 `-2`、`-3`）；账期自动取账单最早/最晚日期；不继承当前账本的 `decisions`，本机 `local_rules.py` 仍全局生效。构建失败不会留下半成品，也不会关闭当前窗口。
+- **数据库校验**：`ledger.validate_database` 只读检查必需表、`metadata` 键、`schema_version`、日期范围、`decisions` JSON 和 `integrity_check`。启动、选择数据库和切换前都先校验，失败时当前窗口保持不变。
+- **切换窗口**：`switch_database` 先校验新账本，再关闭旧窗口（`_closed=True`、取消 `_poll_after`），销毁 root 子控件和菜单，创建新的 `LedgerWindow`。旧汇率线程只写旧队列，不再触碰新窗口；新窗口创建失败时尝试恢复旧账本。
+- **重命名**：只改同一目录下的文件名（支持大小写改名），成功后 `retarget` 更新 `database`、标题、副标题和上次数据库配置；数据库内容、`input_root`、`decisions`、汇率缓存都不变，页面筛选和滚动位置保留。
+- **上次数据库**：`output/last_database.json`（不入库）。`main` 未显式传 `--db` 时优先打开上次有效账本，否则回退 `ledger.DATABASE`；显式 `--db` 优先并写回配置。
+- 汇率缓存跟随账本目录；导入到新目录时会在新目录生成自己的 `exchange_rates.json`。
+- 命令行默认路径不变：重命名默认账本后，命令行需要用 `--db` 指定新路径。
+
+## 11. 扩展点
 
 - **新增交易类型**：同步 `accounting.KINDS`、`ledger_gui.KINDS`、`terminal.KINDS`，检查 `reports.entries`、`ledger.audit` 的统计分支和方向校验。
 - **新增账单来源**：在 `sources.load_statements` 增加文件名识别和 `normalize` 分支，补齐必需列校验。

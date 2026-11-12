@@ -1,6 +1,6 @@
 # 变更记录
 
-本项目不是 git 仓库，本文件是唯一的历史记录。每次改动在顶部追加一条，日期使用 `YYYY-MM-DD`。
+本项目已纳入 Git；本文件仍用于记录每次变更的动机和影响。每次改动在顶部追加一条，日期使用 `YYYY-MM-DD`。
 
 格式建议：
 
@@ -14,6 +14,19 @@
 ```
 
 ---
+
+## 2026-11-12 多账本：导入新账单与数据库管理
+
+- 行为变化：窗口新增「账本」菜单：导入新账单（Ctrl+N）、选择数据库（Ctrl+O）、重命名当前数据库（F2）、退出。
+- 导入新账单：选择账单目录后新建独立账本并打开；自动命名为 `<目录名>-YYYY-MM-DD.sqlite3`（冲突追加 `-2`），放在当前账本同目录；账期取账单最早/最晚日期；不继承当前账本的 `decisions`，本机 `local_rules.py` 仍全局生效。构建失败不关闭当前窗口。
+- 数据库管理：选择任意本程序账本；重命名只改同一目录下的文件名，成功后原地更新路径、标题、副标题和上次数据库配置，保留当前筛选/选中/滚动。
+- 上次数据库：`output/last_database.json`（不入库）；启动时未传 `--db` 则自动打开上次有效账本，缺失/无效时回退默认；显式 `--db` 优先。
+- 新增 `ledger.validate_database`：只读检查必需表、metadata 键、schema_version、日期、decisions JSON 和完整性；启动、选择和切换前校验。
+- 切换窗口会取消旧汇率轮询（`_closed`/`_poll_after`），销毁旧菜单和页面后重建 `LedgerWindow`；失败时尝试恢复旧账本。
+- 文档修正：项目已纳入 Git，不再声称「不是 git 仓库」；CHANGELOG 仍作为主要变更记录。
+- 涉及文件：`ledger.py`、`ledger_gui.py`、`README.md`、`code/README.md`、`docs/ARCHITECTURE.md`、`docs/DEVELOPMENT.md`、`docs/README.md`、`code/CLAUDE.md`。
+- 验证方式：数据库校验/命名/last-DB 单元检查；账本副本上的切换、选择、重命名、导入和无网络轮询取消测试；真实批次 `交易记录/26.11.12kyh` 导入临时账本；真实 `output/收支账本.sqlite3` SHA-256 前后一致；`py_compile`、`audit`。
+- 兼容性：数据库 schema、`decisions` 和数据格式不变；已有账本可直接选择打开；命令行默认路径不变。
 
 ## 2026-11-11 交易明细可隐藏退款
 

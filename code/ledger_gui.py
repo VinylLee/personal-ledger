@@ -3,6 +3,7 @@
 import argparse
 import json
 import queue
+import re
 import sqlite3
 import threading
 import tkinter as tk
@@ -14,7 +15,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from tkinter import filedialog, font, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
@@ -42,6 +43,95 @@ OUT_ONLY_KINDS = frozenset(("expense", "advance"))
 IN_OR_NEUTRAL_KINDS = frozenset(("income", "refund", "reimbursement"))
 DIRECTIONS = {"in": "流入", "out": "流出", "neutral": "中性", "income": "收入", "expense": "支出"}
 SOURCES = {"alipay": "支付宝", "wechat": "微信", "icbc": "工行", "ccb": "建行"}
+
+LAST_DATABASE = ledger.WORKSPACE / "output" / "last_database.json"
+DATABASE_SUFFIXES = (".sqlite3", ".sqlite", ".db")
+INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+WINDOWS_RESERVED_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+})
+
+
+def read_last_database(path=None):
+    config = Path(path) if path is not None else LAST_DATABASE
+    try:
+        payload = json.loads(config.read_text(encoding="utf-8"))
+        value = payload["database"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    database = Path(value).expanduser()
+    if not database.is_absolute():
+        database = ledger.WORKSPACE / database
+    return database if database.is_file() else None
+
+
+def write_last_database(database, path=None):
+    target = Path(path) if path is not None else LAST_DATABASE
+    payload = {
+        "schema_version": 1,
+        "database": str(Path(database).resolve()),
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    temp = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile("w", encoding="utf-8", dir=target.parent,
+                                prefix=".last-database-", suffix=".json", delete=False) as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            temp = Path(stream.name)
+        temp.replace(target)
+        return True
+    except OSError:
+        if temp is not None:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
+
+
+def resolve_startup_database(explicit=None, *, config=None):
+    if explicit is not None:
+        return Path(explicit).resolve()
+    saved = read_last_database(config)
+    if saved is not None:
+        try:
+            ledger.validate_database(saved)
+        except (ValueError, OSError, sqlite3.Error):
+            pass
+        else:
+            return saved.resolve()
+    return ledger.DATABASE.resolve()
+
+
+def safe_database_stem(label, *, limit=48):
+    stem = INVALID_FILENAME_CHARS.sub("-", str(label or "")).strip(" .")
+    stem = re.sub(r"\s+", " ", stem)[:limit].strip(" .")
+    if not stem:
+        stem = "导入账单"
+    if stem.split(".")[0].upper() in WINDOWS_RESERVED_NAMES:
+        stem = "_" + stem
+    return stem
+
+
+def next_database_path(directory, label, *, today=None):
+    directory = Path(directory)
+    stamp = (today or date.today()).isoformat()
+    tail = f"-{stamp}.sqlite3"
+    stem = safe_database_stem(label)
+    max_stem = max(8, 240 - len(str(directory)) - len(tail) - 8)
+    stem = stem[:max_stem].strip(" .") or "导入账单"
+    base = f"{stem}-{stamp}"
+    candidate = directory / f"{base}.sqlite3"
+    counter = 2
+    while candidate.exists():
+        candidate = directory / f"{base}-{counter}.sqlite3"
+        counter += 1
+    return candidate
 
 
 def report_totals_text(totals, side, book):
@@ -896,9 +986,10 @@ class BatchAllocationDialog(ConfirmationDialog):
 
 class LedgerWindow:
     def __init__(self, root, database):
-        self.root, self.database = root, database
-        with closing(ledger.open_db(database)) as db:
-            self.meta = dict(db.execute("SELECT key, value FROM metadata"))
+        self.root = root
+        self.database = Path(database).resolve()
+        self.meta = ledger.validate_database(self.database)
+        with closing(ledger.open_db(self.database)) as db:
             currencies = [r[0] for r in db.execute("SELECT DISTINCT currency FROM events ORDER BY currency")]
             categories = [r[0] for r in db.execute("SELECT DISTINCT category FROM events ORDER BY category")]
         self.currencies = [ALL, *currencies]
@@ -913,18 +1004,22 @@ class LedgerWindow:
         self.applied_forms = {}
         self.active_page = None
         self.status = tk.StringVar(root)
+        self.subtitle = tk.StringVar(
+            root, f"{self.meta['start']} 至 {self.meta['end']}  ·  {self.database.name}")
         self.totals = tk.StringVar(root)
         self.transaction_totals = tk.StringVar(root)
         self.chart_note = tk.StringVar(root)
         self.chart_scope = None
         self.chart_detail = None
         self.chart_detail_text = tk.StringVar(root)
+        self._closed = False
+        self._poll_after = None
         self._rate_book = None
         self._rate_fetching = False
         self._rate_attempted = False
         self._rate_retry_at = None
         self._rate_queue = queue.Queue()
-        root.title("收支账本")
+        root.title(f"收支账本 · {self.database.name}")
         width = min(1140, root.winfo_screenwidth() - 48)
         height = min(760, root.winfo_screenheight() - 94)
         root.geometry(f"{width}x{height}")
@@ -933,7 +1028,7 @@ class LedgerWindow:
         window = ttk.Frame(root, padding=(22, 16))
         window.pack(fill="both", expand=True)
         ttk.Label(window, text="收支账本", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(window, text=f"{self.meta['start']} 至 {self.meta['end']}  ·  {database.name}",
+        ttk.Label(window, textvariable=self.subtitle,
                   style="Muted.TLabel").pack(anchor="w", pady=(0, 14))
         self.tabs = ttk.Notebook(window)
         self.tabs.pack(fill="both", expand=True)
@@ -943,7 +1038,9 @@ class LedgerWindow:
         self.create_charts()
         ttk.Label(window, textvariable=self.status, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
         self.tabs.bind("<<NotebookTabChanged>>", self.tab_changed)
+        self.build_menu()
         self.refresh("report")
+        write_last_database(self.database)
 
     def style(self):
         families = set(font.families(self.root))
@@ -969,6 +1066,66 @@ class LedgerWindow:
         style.configure("Accent.TButton", background="#0E6674", foreground="#FFFFFF")
         style.map("Accent.TButton", background=[("active", "#115E59"), ("disabled", "#94A3B8")])
         self.root.configure(background="#F8FAFC")
+
+    def build_menu(self):
+        self.menubar = tk.Menu(self.root)
+        actions = tk.Menu(self.menubar, tearoff=False)
+        actions.add_command(label="导入新账单…", accelerator="Ctrl+N", command=self.menu_import)
+        actions.add_command(label="选择数据库…", accelerator="Ctrl+O", command=self.menu_choose)
+        actions.add_command(label="重命名当前数据库…", accelerator="F2", command=self.menu_rename)
+        actions.add_separator()
+        actions.add_command(label="退出", command=self.quit_app)
+        self.menubar.add_cascade(label="账本", menu=actions)
+        self.root.configure(menu=self.menubar)
+        self.root.bind("<Control-n>", lambda _: self.menu_import())
+        self.root.bind("<Control-o>", lambda _: self.menu_choose())
+        self.root.bind("<F2>", lambda _: self.menu_rename())
+
+    def menu_import(self):
+        if self._closed:
+            return
+        initial = ledger.WORKSPACE / "交易记录"
+        folder = filedialog.askdirectory(
+            parent=self.root, title="选择账单目录", mustexist=True,
+            initialdir=str(initial if initial.is_dir() else self.database.parent))
+        if folder:
+            import_statements(self, Path(folder))
+
+    def menu_choose(self):
+        if self._closed:
+            return
+        path = filedialog.askopenfilename(
+            parent=self.root, title="选择账本数据库", initialdir=str(self.database.parent),
+            filetypes=[("SQLite 账本", "*.sqlite3 *.sqlite *.db"), ("所有文件", "*.*")])
+        if path:
+            choose_database(self, Path(path))
+
+    def menu_rename(self):
+        if self._closed:
+            return
+        rename_database(self)
+
+    def quit_app(self):
+        self.close()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def close(self):
+        self._closed = True
+        if self._poll_after is not None:
+            try:
+                self.root.after_cancel(self._poll_after)
+            except tk.TclError:
+                pass
+            self._poll_after = None
+
+    def retarget(self, database):
+        self.database = Path(database).resolve()
+        self.root.title(f"收支账本 · {self.database.name}")
+        self.subtitle.set(f"{self.meta['start']} 至 {self.meta['end']}  ·  {self.database.name}")
+        write_last_database(self.database)
 
     def page(self, name, title):
         frame = ttk.Frame(self.tabs, padding=12)
@@ -1287,7 +1444,7 @@ class LedgerWindow:
                 self._rate_fetching = True
                 self._rate_retry_at = now + timedelta(minutes=10)
                 threading.Thread(target=self._refresh_rates, args=(path,), daemon=True).start()
-                self.root.after(100, self._poll_rates)
+                self._poll_after = self.root.after(100, self._poll_rates)
             return cached
         if self._rate_attempted:
             return self._rate_book
@@ -1316,15 +1473,18 @@ class LedgerWindow:
         self._rate_queue.put(fetched)
 
     def _poll_rates(self):
+        if self._closed:
+            return
         try:
             fetched = self._rate_queue.get_nowait()
         except queue.Empty:
             try:
                 if self.root.winfo_exists():
-                    self.root.after(100, self._poll_rates)
+                    self._poll_after = self.root.after(100, self._poll_rates)
             except tk.TclError:
                 pass
             return
+        self._poll_after = None
         self._rate_fetching = False
         if fetched is None:
             return
@@ -1834,13 +1994,179 @@ class LedgerWindow:
         self.status.set("复核规则已导出")
 
 
+def clear_root(root):
+    try:
+        root.configure(menu="")
+    except tk.TclError:
+        pass
+    for child in list(root.winfo_children()):
+        try:
+            child.destroy()
+        except tk.TclError:
+            pass
+
+
+def switch_database(window, database, *, message=None):
+    """Validate and open another ledger, rebuilding the window in place."""
+    target = ledger.validate_database(database)
+    target_path = Path(database).resolve()
+    if target_path == window.database.resolve():
+        write_last_database(target_path)
+        if message:
+            window.status.set(message)
+        return window
+    root = window.root
+    try:
+        geometry = root.geometry()
+        zoomed = root.state() == "zoomed"
+    except tk.TclError:
+        geometry, zoomed = None, False
+    previous = window.database
+    window.close()
+    clear_root(root)
+    try:
+        new_window = LedgerWindow(root, target_path)
+    except Exception as exc:
+        clear_root(root)
+        try:
+            restored = LedgerWindow(root, previous)
+            write_last_database(previous)
+            restored.status.set(f"无法打开新账本：{exc}")
+        except Exception:
+            pass
+        raise ValueError(f"无法打开账本：{exc}") from exc
+    if geometry:
+        try:
+            root.geometry(geometry)
+            if zoomed:
+                root.state("zoomed")
+        except tk.TclError:
+            pass
+    write_last_database(target_path)
+    if message:
+        new_window.status.set(message)
+    return new_window
+
+
+def import_statements(window, source, *, today=None):
+    source = Path(source)
+    if not source.is_dir():
+        messagebox.showerror("导入失败", f"账单目录不存在：{source}", parent=window.root)
+        return None
+    target = next_database_path(window.database.parent, source.name, today=today)
+    previous = window.status.get()
+    window.status.set("正在导入账单并建立新账本…")
+    window.root.configure(cursor="watch")
+    window.root.update_idletasks()
+    result, error = None, None
+    try:
+        result = ledger.build(Namespace(db=target, input=source, start=None, end=None,
+                                        decisions=None, reimbursement_tolerance=None))
+    except (ValueError, OSError, sqlite3.Error, ArithmeticError, KeyError) as exc:
+        error = exc
+    finally:
+        try:
+            window.root.configure(cursor="")
+        except tk.TclError:
+            pass
+    if error is not None:
+        window.status.set(f"导入失败：{error}")
+        messagebox.showerror("导入失败", str(error), parent=window.root)
+        return None
+    if not window._closed:
+        window.status.set(previous)
+    message = f"已导入 {result['sources']} 个账单文件、{result['events']} 笔交易 · {target.name}"
+    try:
+        return switch_database(window, target, message=message)
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        messagebox.showerror("打开新账本失败", str(exc), parent=window.root)
+        return None
+
+
+def choose_database(window, path):
+    path = Path(path)
+    previous = window.status.get()
+    window.status.set("正在打开账本…")
+    window.root.update_idletasks()
+    try:
+        return switch_database(window, path, message=f"已打开 {path.name}")
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        messagebox.showerror("无法打开账本", str(exc), parent=window.root)
+        if not window._closed:
+            window.status.set(previous)
+        return None
+
+
+def database_rename_target(current, name):
+    current = Path(current)
+    name = (name or "").strip()
+    if not name or name in {".", ".."}:
+        raise ValueError("请输入新的数据库文件名。")
+    if any(separator in name for separator in ("/", "\\")):
+        raise ValueError("只能重命名，不能把数据库移动到其他目录。")
+    if INVALID_FILENAME_CHARS.search(name):
+        raise ValueError("文件名包含无效字符。")
+    if name[-1] in " .":
+        raise ValueError("文件名不能以空格或点结尾。")
+    if Path(name).suffix.lower() not in DATABASE_SUFFIXES:
+        name += ".sqlite3"
+    if name.split(".")[0].upper() in WINDOWS_RESERVED_NAMES:
+        raise ValueError("该文件名是 Windows 保留名称，请换一个。")
+    target = current.parent / name
+    if target.exists() and target.resolve() != current.resolve():
+        raise ValueError(f"同名文件已存在：{target.name}")
+    return target
+
+
+def rename_database(window):
+    current = window.database
+    name = simpledialog.askstring("重命名当前数据库", "新的文件名",
+                                  initialvalue=current.name, parent=window.root)
+    if not name:
+        return None
+    try:
+        target = database_rename_target(current, name)
+    except ValueError as exc:
+        messagebox.showerror("无法重命名", str(exc), parent=window.root)
+        return None
+    if target == current:
+        return window
+    if not messagebox.askyesno("重命名当前数据库",
+                               f"确定将 {current.name} 重命名为 {target.name}？", parent=window.root):
+        return None
+    temp = None
+    try:
+        if target.name.lower() == current.name.lower():
+            temp = current.with_name(f".{current.name}.rename-tmp")
+            if temp.exists():
+                raise OSError(f"临时文件已存在：{temp.name}")
+            current.rename(temp)
+            temp.rename(target)
+        else:
+            current.rename(target)
+    except OSError as exc:
+        if temp is not None and temp.exists() and not target.exists():
+            try:
+                temp.rename(current)
+            except OSError:
+                pass
+        messagebox.showerror("重命名失败", f"{exc}\n文件可能被其他程序占用，或目录不可写。",
+                             parent=window.root)
+        return None
+    window.retarget(target)
+    window.status.set(f"已重命名为 {target.name}")
+    return window
+
+
 def main():
     parser = argparse.ArgumentParser(description="个人收支账本桌面界面")
-    parser.add_argument("--db", type=Path, default=ledger.DATABASE, help="SQLite 账本路径")
+    parser.add_argument("--db", type=Path, default=None,
+                        help="SQLite 账本路径；省略时打开上次使用的账本")
     args = parser.parse_args()
     root = tk.Tk()
+    database = resolve_startup_database(args.db)
     try:
-        LedgerWindow(root, args.db.resolve())
+        LedgerWindow(root, database)
     except (ValueError, KeyError, OSError, sqlite3.Error) as exc:
         root.withdraw()
         messagebox.showerror("无法打开账本", str(exc), parent=root)

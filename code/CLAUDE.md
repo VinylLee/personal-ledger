@@ -12,7 +12,7 @@
 
 ## 文档维护（必须）
 
-本项目不是 git 仓库，文档是唯一历史记录。**任何影响行为、数据结构、命令行参数、`decisions` 格式或界面操作的修改，都必须在同一次改动中更新 `docs/`**：
+本项目已纳入 Git（远程 `VinylLee/personal-ledger`），但 `docs/CHANGELOG.md` 仍是主要变更记录。**任何影响行为、数据结构、命令行参数、`decisions` 格式或界面操作的修改，都必须在同一次改动中更新 `docs/`**：
 
 - 架构/数据流变化 → `docs/ARCHITECTURE.md`
 - 命令、测试方法、易错点变化 → `docs/DEVELOPMENT.md`

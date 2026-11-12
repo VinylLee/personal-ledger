@@ -43,6 +43,7 @@ python code/ledger_gui.py --db 路径\其他账本.sqlite3
 - `--db` 放在子命令之前。
 - `build --decisions 路径` 可沿用导出的复核规则；`--reimbursement-tolerance 3` 覆盖报销差额阈值。
 - 命令行 `--format csv|json` 便于给其他程序用；默认是中文表格。
+- GUI 不传 `--db` 时打开 `output/last_database.json` 记录的上次账本；显式 `--db` 优先。命令行 `ledger.py` 的默认路径仍是 `output/收支账本.sqlite3`，重命名默认账本后命令行需显式 `--db`。
 
 ## 3. 测试策略
 
@@ -146,6 +147,17 @@ Tk 控件状态用 `widget.state()` 或 `str(widget.cget("key"))` 判断；`cget
 - 界面：主窗口和涉及的对话框能否构造；按钮禁用状态是否符合当前页签。
 - 汇率：两个汇总标签正确、表格不变；CNY-only 视图不联网；断网/无缓存时正常降级。
 
+### 3.6 多账本与数据库管理测试
+
+- 所有测试使用临时目录和账本副本；把 `ledger_gui.LAST_DATABASE` 指向临时 JSON，避免写入真实 `output/last_database.json`。
+- **校验**：有效账本通过；文本文件、缺表、缺 metadata 键、损坏文件都抛 `ValueError`，且不修改文件。
+- **自动命名**：用固定 `today` 调 `next_database_path`；预置同名文件验证 `-2`；覆盖非法字符、空名、Windows 保留名和长路径。
+- **导入**：用真实批次目录（如 `交易记录/26.11.12kyh`，只读）向临时当前账本目录导入；断言新库文件存在、`metadata.input_root` 指向该目录、`decisions.classify` 为空、事件数 > 0、窗口切换到新库。导入失败（空目录）时当前窗口保持、无新文件。
+- **切换/选择**：准备两个有效副本；`switch_database` 返回新实例、旧实例 `_closed=True`、菜单重建、标题/副标题/上次数据库更新；无效文件只弹错误，当前窗口不变。
+- **重命名**：替换 `simpledialog.askstring`/`messagebox.askyesno`；验证成功改名、`retarget` 更新路径/标题/配置、筛选状态保留；同名文件、路径分隔符、Windows 保留名、空名都被拒绝。
+- **轮询取消**：准备过期汇率缓存触发后台轮询，切换窗口后反复 `root.update()`，确认旧实例不再更新新窗口、无 Tk 异常。
+- **真实数据安全**：测试前后比较 `output/收支账本.sqlite3` 的 SHA-256，确保未被修改。
+
 ## 4. 修改检查清单
 
 ### 4.1 改一处，记得查这几处
@@ -157,6 +169,8 @@ Tk 控件状态用 `widget.state()` 或 `str(widget.cget("key"))` 判断；`cget
 | `decisions` 新键 | `ledger.read_decisions` 白名单、`ledger.build` 应用逻辑、界面保存/导出、用户 README、本文档 |
 | 数据库字段 | `ledger.SCHEMA`、`EVENT_FIELDS`、`sources.Record`、`build` 插入、查询 SELECT、`audit` |
 | 新建界面页 | `create_<page>`、`load_<page>`、`LedgerWindow.__init__` 中的创建顺序；`refresh` 依赖命名约定 |
+| 菜单/数据库操作 | `ledger.validate_database`、`ledger_gui.LAST_DATABASE`、`switch_database`、`import_statements`、`choose_database`、`rename_database`；切换窗口必须取消汇率轮询 |
+| 上次数据库 | `output/last_database.json`、`read_last_database`、`write_last_database`、`resolve_startup_database`、`main --db` 语义 |
 | 新写操作 | 校验函数、`save_*`、`rebuild_with_decisions`、界面刷新与状态提示、失败回滚 |
 | 账单格式 | `sources.load_statements` 文件名识别、`normalize`、`read_rows`、必需列校验 |
 | 汇率/汇总折算 | `exchange.py`、`ledger_gui.py` 的 `report_totals_text` / `transaction_totals_text`；不要改 `reports.py`、`terminal.py`、`charts.py` 或数据库 |
@@ -186,6 +200,10 @@ Tk 控件状态用 `widget.state()` 或 `str(widget.cget("key"))` 判断；`cget
 - **汇率方向不能写反**：`rates["USD"]` 是「1 CNY 换多少 USD」，折算人民币要用除法 `金额 / rate`。全部用 `Decimal`，不要用 float；合计先累加未舍入值，最后统一格式化。
 - **汇率只在两个汇总标签**：不要改 `reports.py`、`terminal.py`、`charts.py`、表格行或数据库。只有 CNY 的视图不要触发网络；缓存文件与账本同目录，默认在 `output/exchange_rates.json`，不要提交。
 - **后台汇率刷新**：线程只做网络/文件 I/O，把结果放入队列；主线程用 `root.after` 轮询并更新 UI。不要在后台线程直接调用 `root.after` 或任何 Tk 方法（会报 `main thread is not in main loop`）；窗口关闭时用 `winfo_exists()` 保护。
+- **导入新账单总是新建账本**：不要合并到当前库；测试用临时当前账本目录，真实账单目录只读，失败时不留下目标文件。
+- **上次数据库配置**：`output/last_database.json` 不入库；测试必须把 `LAST_DATABASE` 指到临时文件，避免污染真实启动状态。
+- **重命名默认账本**：GUI 会记住新名字，但命令行默认仍是 `output/收支账本.sqlite3`；命令行需显式 `--db`。
+- **切换数据库要重建窗口**：先 `ledger.validate_database`，再 `close()` 取消 `_poll_after`、销毁 root 子控件和菜单，最后创建新 `LedgerWindow`；否则旧汇率轮询或旧控件会操作新窗口。重命名只需 `retarget`，不必重建。
 
 ## 6. 代码约定
 
